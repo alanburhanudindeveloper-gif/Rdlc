@@ -12,6 +12,23 @@ export interface RdlcPreviewCollision {
   overlapCm: string;
 }
 
+export interface RdlcPreviewClippedRow {
+  page: number;
+  tablixName: string;
+  rowIndex: number;
+  declaredHeightPt: number;
+  requiredHeightPt: number;
+  textPreview: string;
+}
+
+export interface RdlcPageSpillover {
+  sourcePage: number;
+  renderedPages: number;
+  compiledHeightPt: number;
+  availableBodyHeightPt: number;
+  offendingTablixes: string[];
+}
+
 export interface RdlcPreviewResult {
   html: string;
   pageCount: number;
@@ -27,6 +44,8 @@ export interface RdlcPreviewResult {
     parameters: number;
   };
   collisions: RdlcPreviewCollision[];
+  clippedRows: RdlcPreviewClippedRow[];
+  pageSpillovers: RdlcPageSpillover[];
 }
 
 export interface RdlcRenderOptions {
@@ -316,6 +335,7 @@ interface ParsedRdlcContext {
   footerItemsNode?: OrderedNode;
   bodyNode?: OrderedNode;
   pages: ParsedPageSlice[];
+  pageSpillovers: RdlcPageSpillover[];
 }
 
 export class RdlcVisualPreviewRenderer {
@@ -584,7 +604,7 @@ export class RdlcVisualPreviewRenderer {
       pages = [{ pageNum: 1, items: [] }];
     }
 
-    return {
+    const tempCtx: ParsedRdlcContext = {
       reportNode,
       embeddedImages,
       params,
@@ -614,7 +634,306 @@ export class RdlcVisualPreviewRenderer {
       footerItemsNode,
       bodyNode,
       pages,
+      pageSpillovers: [],
     };
+
+    if (!isMultiPageContainers) {
+      const { paginatedPages, pageSpillovers } = this.paginateOverflowingSlices(tempCtx);
+      tempCtx.pages = paginatedPages;
+      tempCtx.pageSpillovers = pageSpillovers;
+    }
+
+    return tempCtx;
+  }
+
+  private measureTablixRowHeightsForPagination(
+    tblNode: OrderedNode,
+    ctx: ParsedRdlcContext,
+    pageNum: number
+  ): number[] {
+    const tBody = childOf(tblNode, 'TablixBody');
+    const colWidthsPt = childrenOf(childOf(tBody, 'TablixColumns'), 'TablixColumn').map((c) =>
+      Math.max(4, dimToPt(textOf(c, 'Width'), 36))
+    );
+    const expandedRows = this.expandTablixRows(tblNode, ctx);
+    const rowHeightsPt = expandedRows.map(({ rowNode }) =>
+      Math.max(4, dimToPt(textOf(rowNode, 'Height'), 14))
+    );
+    const totalPages = Math.max(1, ctx.pages.length);
+    const covered = Array.from({ length: expandedRows.length }, () =>
+      Array(colWidthsPt.length).fill(false)
+    );
+
+    expandedRows.forEach(({ rowNode: r, rowFields }, rIdx) => {
+      const cells = childrenOf(childOf(r, 'TablixCells'), 'TablixCell');
+      cells.forEach((cell, cIdx) => {
+        if (covered[rIdx]?.[cIdx]) return;
+        const cc = childOf(cell, 'CellContents');
+        if (!cc) return;
+        const cs = Math.max(1, Number(textOf(cc, 'ColSpan') || 1));
+        const rs = Math.max(1, Number(textOf(cc, 'RowSpan') || 1));
+        for (let rr = rIdx; rr < Math.min(expandedRows.length, rIdx + rs); rr++) {
+          for (let ccIdx = cIdx; ccIdx < Math.min(colWidthsPt.length, cIdx + cs); ccIdx++) {
+            if (rr !== rIdx || ccIdx !== cIdx) covered[rr][ccIdx] = true;
+          }
+        }
+        const tb = childOf(cc, 'Textbox');
+        if (!tb || textOf(tb, 'CanGrow').trim().toLowerCase() === 'false') return;
+        const spanW = colWidthsPt
+          .slice(cIdx, Math.min(colWidthsPt.length, cIdx + cs))
+          .reduce((a, b) => a + b, 0);
+        const st = parseStyle(childOf(tb, 'Style'));
+        const padL = dimToPt(st.PaddingLeft as string | undefined, 3);
+        const padR = dimToPt(st.PaddingRight as string | undefined, 3);
+        const padT = dimToPt(st.PaddingTop as string | undefined, 2);
+        const padB = dimToPt(st.PaddingBottom as string | undefined, 2);
+        const innerW = Math.max(12, spanW - padL - padR);
+        const paras = childrenOf(childOf(tb, 'Paragraphs'), 'Paragraph');
+        let contentH = 0;
+        for (const p of paras) {
+          const ps = parseStyle(childOf(p, 'Style'));
+          const spaceBefore = dimToPt(ps.SpaceBefore as string | undefined, 0);
+          const spaceAfter = dimToPt(ps.SpaceAfter as string | undefined, 0);
+          const runs = childrenOf(childOf(p, 'TextRuns'), 'TextRun');
+          let paraText = '';
+          let maxFontPt = 7.5;
+          let anyBold = false;
+          for (const runNode of runs) {
+            const rsStyle = parseStyle(childOf(runNode, 'Style'));
+            const fs = Math.max(4, dimToPt(rsStyle.FontSize as string | undefined, 7.5));
+            if (fs > maxFontPt) maxFontPt = fs;
+            if (rsStyle.FontWeight === 'Bold') anyBold = true;
+            paraText += this.evalExpr(ctx, textOf(runNode, 'Value'), pageNum, totalPages, rowFields);
+          }
+          const trimmed = paraText.trim();
+          const explicitLineH = dimToPt(ps.LineHeight as string | undefined, 0);
+          const lineH = explicitLineH > 0 ? explicitLineH : maxFontPt * 1.24;
+          const avgCharW = maxFontPt * (anyBold ? 0.52 : 0.48);
+          let lineCount = 0;
+          if (trimmed.length === 0) {
+            lineCount = 1;
+          } else {
+            for (const seg of trimmed.split('\n')) {
+              const words = seg.split(/\s+/).filter(Boolean);
+              if (words.length === 0) {
+                lineCount += 1;
+                continue;
+              }
+              let curW = 0;
+              let segLines = 1;
+              for (const w of words) {
+                const ww = w.length * avgCharW;
+                const spaceW = curW > 0 ? avgCharW * 0.6 : 0;
+                if (curW > 0 && curW + spaceW + ww > innerW) {
+                  segLines++;
+                  curW = ww;
+                } else {
+                  curW += spaceW + ww;
+                }
+              }
+              lineCount += segLines;
+            }
+          }
+          contentH += spaceBefore + lineCount * lineH + spaceAfter;
+        }
+        const neededH = contentH + padT + padB;
+        const curSpanH = rowHeightsPt
+          .slice(rIdx, Math.min(expandedRows.length, rIdx + rs))
+          .reduce((a, b) => a + b, 0);
+        if (neededH > curSpanH) {
+          const targetRow = Math.min(expandedRows.length - 1, rIdx + rs - 1);
+          rowHeightsPt[targetRow] += neededH - curSpanH;
+        }
+      });
+    });
+
+    return rowHeightsPt;
+  }
+
+  private cloneTablixRowSlice(
+    tblNode: OrderedNode,
+    startRow: number,
+    endRow: number,
+    newTopPt: number,
+    newHeightPt: number
+  ): OrderedNode {
+    const children = Array.isArray(tblNode.Tablix) ? (tblNode.Tablix as OrderedNode[]) : [];
+    const nextChildren = children.map((ch) => {
+      const ck = tagName(ch);
+      if (ck === 'Top') return { Top: [{ '#text': `${Math.round(newTopPt * 100) / 100}pt` }] };
+      if (ck === 'Height') return { Height: [{ '#text': `${Math.round(newHeightPt * 100) / 100}pt` }] };
+      if (ck === 'TablixBody') {
+        const tbChildren = Array.isArray(ch.TablixBody) ? (ch.TablixBody as OrderedNode[]) : [];
+        return {
+          TablixBody: tbChildren.map((tbc) => {
+            if (tagName(tbc) !== 'TablixRows') return tbc;
+            const rows = childrenOf(tbc, 'TablixRow');
+            return { TablixRows: rows.slice(startRow, endRow) };
+          }),
+        };
+      }
+      if (ck === 'TablixRowHierarchy') {
+        const rhChildren = Array.isArray(ch.TablixRowHierarchy) ? (ch.TablixRowHierarchy as OrderedNode[]) : [];
+        return {
+          TablixRowHierarchy: rhChildren.map((rhc) => {
+            if (tagName(rhc) !== 'TablixMembers') return rhc;
+            const members = childrenOf(rhc, 'TablixMember');
+            return { TablixMembers: members.slice(startRow, endRow) };
+          }),
+        };
+      }
+      return ch;
+    });
+    return { ...tblNode, Tablix: nextChildren };
+  }
+
+  private paginateOverflowingSlices(ctx: ParsedRdlcContext): {
+    paginatedPages: ParsedPageSlice[];
+    pageSpillovers: RdlcPageSpillover[];
+  } {
+    const paginatedPages: ParsedPageSlice[] = [];
+    const pageSpillovers: RdlcPageSpillover[] = [];
+
+    for (let sIdx = 0; sIdx < ctx.pages.length; sIdx++) {
+      const slice = ctx.pages[sIdx];
+      const sourcePage = sIdx + 1;
+      const showHeader = Boolean(ctx.headerItemsNode) && !(sourcePage === 1 && !ctx.headerPrintOnFirstPage);
+      const showFooter = Boolean(ctx.footerItemsNode) && !(sourcePage === 1 && !ctx.footerPrintOnFirstPage);
+      const availableBodyHeightPt = Math.max(
+        72,
+        ctx.pageHPt - ctx.topMPt - ctx.bottomMPt - (showHeader ? ctx.headerHPt : 0) - (showFooter ? ctx.footerHPt : 0)
+      );
+
+      interface MeasuredSliceItem {
+        node: OrderedNode;
+        topOffsetPt: number;
+        relTopPt: number;
+        heightPt: number;
+        rowHeightsPt?: number[];
+      }
+
+      const measured: MeasuredSliceItem[] = slice.items.map(({ node, topOffsetPt }) => {
+        const relTopPt = Math.max(0, dimToPt(textOf(node, 'Top'), 0) - topOffsetPt);
+        if (tagName(node) === 'Tablix') {
+          const rowHeightsPt = this.measureTablixRowHeightsForPagination(node, ctx, sourcePage);
+          const sumRowH = rowHeightsPt.reduce((a, b) => a + b, 0);
+          const declaredH = dimToPt(textOf(node, 'Height'), 14);
+          return {
+            node,
+            topOffsetPt,
+            relTopPt,
+            heightPt: Math.max(declaredH, sumRowH),
+            rowHeightsPt,
+          };
+        }
+        return {
+          node,
+          topOffsetPt,
+          relTopPt,
+          heightPt: Math.max(12, dimToPt(textOf(node, 'Height'), 14)),
+        };
+      });
+
+      const compiledHeightPt = measured.reduce(
+        (mx, m) => Math.max(mx, m.relTopPt + m.heightPt),
+        0
+      );
+
+      if (compiledHeightPt <= availableBodyHeightPt + 0.5) {
+        paginatedPages.push({
+          ...slice,
+          pageNum: paginatedPages.length + 1,
+        });
+        continue;
+      }
+
+      const offendingTablixes = measured
+        .filter((m) => tagName(m.node) === 'Tablix' && m.relTopPt + m.heightPt > availableBodyHeightPt + 0.5)
+        .map((m) => attrOf(m.node, 'Name'))
+        .filter(Boolean);
+      if (offendingTablixes.length === 0) {
+        const fallbackTbl = measured.find((m) => tagName(m.node) === 'Tablix');
+        if (fallbackTbl) {
+          const nm = attrOf(fallbackTbl.node, 'Name');
+          if (nm) offendingTablixes.push(nm);
+        }
+      }
+
+      const subPageCount = Math.max(2, Math.ceil(compiledHeightPt / availableBodyHeightPt));
+      const buckets: Array<Array<{ node: OrderedNode; topOffsetPt: number }>> = Array.from(
+        { length: subPageCount },
+        () => []
+      );
+
+      for (const m of measured) {
+        const firstSubIdx = Math.min(
+          subPageCount - 1,
+          Math.max(0, Math.floor(m.relTopPt / availableBodyHeightPt))
+        );
+        if (tagName(m.node) !== 'Tablix' || !m.rowHeightsPt || m.rowHeightsPt.length <= 1) {
+          buckets[firstSubIdx].push({
+            node: m.node,
+            topOffsetPt: m.topOffsetPt + firstSubIdx * availableBodyHeightPt,
+          });
+          continue;
+        }
+
+        // Partition overflowing Tablix rows cleanly across sub-pages
+        let rowCursor = 0;
+        let curSub = firstSubIdx;
+        while (rowCursor < m.rowHeightsPt.length && curSub < subPageCount) {
+          const bandLimitPt = (curSub + 1) * availableBodyHeightPt + 0.5;
+          let accPt = rowCursor === 0 ? m.relTopPt : curSub * availableBodyHeightPt;
+          let endRow = rowCursor;
+          while (endRow < m.rowHeightsPt.length) {
+            const rh = m.rowHeightsPt[endRow];
+            if (endRow > rowCursor && accPt + rh > bandLimitPt && curSub < subPageCount - 1) {
+              break;
+            }
+            accPt += rh;
+            endRow++;
+          }
+          if (endRow === rowCursor) endRow = rowCursor + 1;
+          const sliceTopPt = rowCursor === 0 ? m.relTopPt - curSub * availableBodyHeightPt : 0;
+          const sliceH = m.rowHeightsPt.slice(rowCursor, endRow).reduce((a, b) => a + b, 0);
+          const slicedNode =
+            rowCursor === 0 && endRow === m.rowHeightsPt.length
+              ? m.node
+              : this.cloneTablixRowSlice(m.node, rowCursor, endRow, Math.max(0, sliceTopPt), sliceH);
+          buckets[curSub].push({
+            node: slicedNode,
+            topOffsetPt: rowCursor === 0 && endRow === m.rowHeightsPt.length ? m.topOffsetPt + curSub * availableBodyHeightPt : 0,
+          });
+          rowCursor = endRow;
+          curSub++;
+        }
+      }
+
+      const nonEmptySub = buckets.filter((b) => b.length > 0);
+      const renderedPagesForSlice = Math.max(2, nonEmptySub.length);
+      for (let k = 0; k < nonEmptySub.length; k++) {
+        paginatedPages.push({
+          pageNum: paginatedPages.length + 1,
+          items: nonEmptySub[k],
+        });
+      }
+      if (nonEmptySub.length < 2) {
+        paginatedPages.push({
+          pageNum: paginatedPages.length + 1,
+          items: [],
+        });
+      }
+
+      pageSpillovers.push({
+        sourcePage,
+        renderedPages: renderedPagesForSlice,
+        compiledHeightPt: Math.round(compiledHeightPt * 10) / 10,
+        availableBodyHeightPt: Math.round(availableBodyHeightPt * 10) / 10,
+        offendingTablixes,
+      });
+    }
+
+    return { paginatedPages, pageSpillovers };
   }
 
   private evalExpr(
@@ -882,9 +1201,9 @@ export class RdlcVisualPreviewRenderer {
       const left = safeDim(textOf(tblNode, 'Left'), '0cm');
       const width = safeDim(textOf(tblNode, 'Width'), '100%');
       const tBody = childOf(tblNode, 'TablixBody');
-      const colWidths = childrenOf(childOf(tBody, 'TablixColumns'), 'TablixColumn').map((c) =>
-        safeDim(textOf(c, 'Width'), 'auto')
-      );
+      const colNodes = childrenOf(childOf(tBody, 'TablixColumns'), 'TablixColumn');
+      const colWidths = colNodes.map((c) => safeDim(textOf(c, 'Width'), 'auto'));
+      const colWidthsPt = colNodes.map((c) => Math.max(4, dimToPt(textOf(c, 'Width'), 36)));
       const expandedRows = this.expandTablixRows(tblNode, ctx);
       const colgroup = `<colgroup>${colWidths.map((w) => `<col style="width:${w};" />`).join('')}</colgroup>`;
       const covered = Array.from({ length: expandedRows.length }, () => Array(colWidths.length).fill(false));
@@ -892,6 +1211,9 @@ export class RdlcVisualPreviewRenderer {
       const trs = expandedRows
         .map(({ rowNode: r, rowFields }, rIdx) => {
           const rH = safeDim(textOf(r, 'Height'), 'auto');
+          const declaredRowPt = dimToPt(textOf(r, 'Height'), 14);
+          let maxRequiredRowPt = 0;
+          let clipPreviewText = '';
           const cells = childrenOf(childOf(r, 'TablixCells'), 'TablixCell');
           const tds: string[] = [];
           cells.forEach((cell, cIdx) => {
@@ -950,10 +1272,85 @@ export class RdlcVisualPreviewRenderer {
             const vAlignRaw = String(st.VerticalAlign || 'Middle');
             const vAlign = SAFE_ALIGN_RE.test(vAlignRaw) ? vAlignRaw.toLowerCase() : 'middle';
             const inner = tb ? renderParagraphs(tb, pageNum, rowFields) : '';
+            if (tb) {
+              const spanW = colWidthsPt
+                .slice(cIdx, Math.min(colWidthsPt.length, cIdx + cs))
+                .reduce((a, b) => a + b, 0);
+              const padL = dimToPt(st.PaddingLeft as string | undefined, 3);
+              const padR = dimToPt(st.PaddingRight as string | undefined, 3);
+              const padT = dimToPt(st.PaddingTop as string | undefined, 2);
+              const padB = dimToPt(st.PaddingBottom as string | undefined, 2);
+              const innerW = Math.max(12, spanW - padL - padR);
+              const paras = childrenOf(childOf(tb, 'Paragraphs'), 'Paragraph');
+              let contentH = 0;
+              let previewSnippet = '';
+              for (const p of paras) {
+                const ps = parseStyle(childOf(p, 'Style'));
+                const spaceBefore = dimToPt(ps.SpaceBefore as string | undefined, 0);
+                const spaceAfter = dimToPt(ps.SpaceAfter as string | undefined, 0);
+                const runs = childrenOf(childOf(p, 'TextRuns'), 'TextRun');
+                let paraText = '';
+                let maxFontPt = 7.5;
+                let anyBold = false;
+                for (const runNode of runs) {
+                  const rs = parseStyle(childOf(runNode, 'Style'));
+                  const fs = Math.max(4, dimToPt(rs.FontSize as string | undefined, 7.5));
+                  if (fs > maxFontPt) maxFontPt = fs;
+                  if (rs.FontWeight === 'Bold') anyBold = true;
+                  paraText += this.evalExpr(ctx, textOf(runNode, 'Value'), pageNum, totalPages, rowFields);
+                }
+                const trimmed = paraText.trim();
+                if (!previewSnippet && trimmed) previewSnippet = trimmed.slice(0, 80);
+                const explicitLineH = dimToPt(ps.LineHeight as string | undefined, 0);
+                const lineH = explicitLineH > 0 ? explicitLineH : maxFontPt * 1.24;
+                const avgCharW = maxFontPt * (anyBold ? 0.52 : 0.48);
+                let lineCount = 0;
+                if (trimmed.length === 0) {
+                  lineCount = 1;
+                } else {
+                  for (const seg of trimmed.split('\n')) {
+                    const words = seg.split(/\s+/).filter(Boolean);
+                    if (words.length === 0) {
+                      lineCount += 1;
+                      continue;
+                    }
+                    let curW = 0;
+                    let segLines = 1;
+                    for (const w of words) {
+                      const ww = w.length * avgCharW;
+                      const spaceW = curW > 0 ? avgCharW * 0.6 : 0;
+                      if (curW > 0 && curW + spaceW + ww > innerW) {
+                        segLines++;
+                        curW = ww;
+                      } else {
+                        curW += spaceW + ww;
+                      }
+                    }
+                    lineCount += segLines;
+                  }
+                }
+                contentH += spaceBefore + lineCount * lineH + spaceAfter;
+              }
+              const reqH = contentH + padT + padB;
+              if (reqH > maxRequiredRowPt) {
+                maxRequiredRowPt = reqH;
+                if (previewSnippet) clipPreviewText = previewSnippet;
+              }
+            }
             tds.push(
               `<td${spanAttrs} style="${bgCss}${borderCss(st)}${padCss}vertical-align:${vAlign};box-sizing:border-box;">${inner}</td>`
             );
           });
+          if (maxRequiredRowPt > declaredRowPt + 2.5 && clipPreviewText) {
+            clippedRows.push({
+              page: pageNum,
+              tablixName: attrOf(tblNode, 'Name') || name,
+              rowIndex: rIdx,
+              declaredHeightPt: Math.round(declaredRowPt * 10) / 10,
+              requiredHeightPt: Math.round(maxRequiredRowPt * 10) / 10,
+              textPreview: clipPreviewText,
+            });
+          }
           return `<tr style="height:${rH};">${tds.join('')}</tr>`;
         })
         .join('');
@@ -991,6 +1388,7 @@ export class RdlcVisualPreviewRenderer {
     };
 
     const collisions: RdlcPreviewCollision[] = [];
+    const clippedRows: RdlcPreviewClippedRow[] = [];
     const checkCollisions = (nodes: OrderedNode[], pageNum: number, containerName: string) => {
       const containerBoxes: Array<{ name: string; x1: number; y1: number; x2: number; y2: number }> = [];
       const fgBoxes: Array<{ name: string; x1: number; y1: number; x2: number; y2: number }> = [];
@@ -1166,6 +1564,7 @@ export class RdlcVisualPreviewRenderer {
       tablixes: stats.tablixes,
       embeddedImages: stats.embeddedImages,
       collisions: collisions.length,
+      clippedRows: clippedRows.length,
     });
 
     return {
@@ -1175,6 +1574,8 @@ export class RdlcVisualPreviewRenderer {
       pageHeight: ctx.pageHStr,
       stats,
       collisions,
+      clippedRows,
+      pageSpillovers: ctx.pageSpillovers,
     };
   }
 

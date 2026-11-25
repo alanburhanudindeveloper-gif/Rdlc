@@ -27,6 +27,9 @@ export interface RdlcValidationRuntimeContext {
   sourcePageCount?: number;
   renderedPageCount?: number;
   collisionsCount?: number;
+  clippedRowsCount?: number;
+  pageSpilloverCount?: number;
+  pageSpilloverSummary?: string[];
   perPageParity?: Array<{ page: number; parityPercent: number }>;
   targetParityPercent?: number;
   deterministicShaMatch?: boolean;
@@ -173,6 +176,7 @@ export class RdlcValidator {
         { pattern: /<\s*AutoRefresh\b/i, label: '<AutoRefresh>' },
         { pattern: /<\s*Visibility\b/i, label: '<Visibility>' },
         { pattern: /<\s*RowSpan\b/i, label: '<RowSpan>' },
+        { pattern: /<\s*LeftIndent\b/i, label: '<LeftIndent>' },
       ];
       for (const ft of forbidden2008Tags) {
         if (ft.pattern.test(rdlcXml)) {
@@ -1048,6 +1052,14 @@ export class RdlcValidator {
             location: 'PreviewRenderer',
           });
         }
+        if (ctx.clippedRowsCount !== undefined && ctx.clippedRowsCount > 0) {
+          errors.push({
+            ruleId: 'RDLC-15',
+            severity: 'ERROR',
+            message: `Row clipping gate failed: ${ctx.clippedRowsCount} Tablix row(s) clip wrapped content.`,
+            location: 'PreviewRenderer',
+          });
+        }
         if (
           ctx.sourcePageCount !== undefined &&
           ctx.renderedPageCount !== undefined &&
@@ -1058,6 +1070,14 @@ export class RdlcValidator {
             severity: 'ERROR',
             message: `Page parity failed: rendered ${ctx.renderedPageCount} page(s) vs source PDF ${ctx.sourcePageCount} page(s).`,
             location: 'VisualDiff',
+          });
+        }
+        if (ctx.pageSpilloverCount !== undefined && ctx.pageSpilloverCount > 0) {
+          errors.push({
+            ruleId: 'RDLC-15',
+            severity: 'ERROR',
+            message: `1:1 Page Parity Gate failed: ${ctx.pageSpilloverCount} source page(s) overflowed onto multiple RDLC pages${ctx.pageSpilloverSummary?.length ? ` (${ctx.pageSpilloverSummary.join('; ')})` : ''}.`,
+            location: 'PreviewRenderer',
           });
         }
         if (ctx.perPageParity && ctx.perPageParity.length > 0) {
@@ -1091,6 +1111,34 @@ export class RdlcValidator {
           ruleId: 'RDLC-2008',
           severity: 'ERROR',
           message: `Layout collision gate failed: ${ctx.collisionsCount} overlapping element pair(s) detected.`,
+          location: 'PreviewRenderer',
+        });
+      }
+      if (ctx.clippedRowsCount !== undefined && ctx.clippedRowsCount > 0) {
+        errors.push({
+          ruleId: 'RDLC-2008',
+          severity: 'ERROR',
+          message: `Row clipping gate failed: ${ctx.clippedRowsCount} Tablix row(s) clip wrapped content.`,
+          location: 'PreviewRenderer',
+        });
+      }
+      if (
+        ctx.sourcePageCount !== undefined &&
+        ctx.renderedPageCount !== undefined &&
+        ctx.renderedPageCount !== ctx.sourcePageCount
+      ) {
+        errors.push({
+          ruleId: 'RDLC-2008',
+          severity: 'ERROR',
+          message: `1:1 Page Parity Gate failed: rendered ${ctx.renderedPageCount} page(s) vs source PDF ${ctx.sourcePageCount} page(s).`,
+          location: 'PreviewRenderer',
+        });
+      }
+      if (ctx.pageSpilloverCount !== undefined && ctx.pageSpilloverCount > 0) {
+        errors.push({
+          ruleId: 'RDLC-2008',
+          severity: 'ERROR',
+          message: `1:1 Page Parity Gate failed: ${ctx.pageSpilloverCount} source page(s) overflowed onto multiple RDLC pages${ctx.pageSpilloverSummary?.length ? ` (${ctx.pageSpilloverSummary.join('; ')})` : ''}.`,
           location: 'PreviewRenderer',
         });
       }

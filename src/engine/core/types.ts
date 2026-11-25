@@ -209,6 +209,38 @@ export interface ReconstructedBand {
   sourceRegionIds: string[];
 }
 
+export type VectorPrimitiveKind = 'HLine' | 'VLine' | 'FillBanner' | 'RowFillBand';
+
+export interface ExtractedVectorPrimitive {
+  id: string;
+  kind: VectorPrimitiveKind;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  xPt: number;
+  yPt: number;
+  widthPt: number;
+  heightPt: number;
+  colorHex?: string;
+  source: 'rle' | 'vector' | 'merged';
+}
+
+export interface PerceivedGeometricContainer {
+  containerKey: string;
+  pageNumber: number;
+  x0Pt: number;
+  y0Pt: number;
+  x1Pt: number;
+  y1Pt: number;
+  features: number[];
+  featureNames?: string[];
+  geometricSignature?: ContainerGeometricSignature;
+  spanCount: number;
+  vLineCount: number;
+  hLineCount: number;
+}
+
 export interface LayoutPage {
   pageNumber: number;
   width: number;
@@ -216,6 +248,8 @@ export interface LayoutPage {
   rawObjectCount: number;
   regions: LayoutRegion[];
   bands: ReconstructedBand[];
+  vectorPrimitives?: ExtractedVectorPrimitive[];
+  geometricContainers?: PerceivedGeometricContainer[];
   rasterPreviewBase64?: string;
   layer0BackgroundBase64?: string;
   layer0ImageName?: string;
@@ -236,8 +270,6 @@ export interface IntermediateLayoutModel {
   pages: LayoutPage[];
 }
 
-export type TablixArchetype = 'A' | 'B' | 'C' | 'D';
-
 export interface TablixTextboxContent {
   kind: 'Textbox';
   name: string;
@@ -247,6 +279,11 @@ export interface TablixTextboxContent {
   isExpression: boolean;
   style: RegionStyle;
   canGrow: boolean;
+  sourceLineCount?: number;
+  sourceX0In?: number;
+  sourceWidthIn?: number;
+  sourceYMinPt?: number;
+  sourceYMaxPt?: number;
 }
 
 export interface TablixImageContent {
@@ -303,13 +340,33 @@ export interface TablixRow {
   cells: TablixCell[];
 }
 
+export type SolverStrategy =
+  | 'PLANAR_GRID_SOLVER'
+  | 'KEY_VALUE_SUBGRID_FLATTENER'
+  | 'DUAL_TRACK_STREAM_SOLVER'
+  | 'INDENTATION_CLAUSE_SOLVER'
+  | 'HLINE_OPERATOR_EQUATION_SOLVER'
+  | 'DENSITY_TRANSITION_SPLITTER';
+
+export interface ContainerGeometricSignature {
+  internalVLineCount: number;
+  shadedRowBandCount: number;
+  hasEmbeddedSubGrid: boolean;
+  indentationLevels: number;
+  operatorColumnCount: number;
+  columnDensityDrop: boolean;
+}
+
 export interface TablixRegion {
   id: string;
   name: string;
   pageNumber: number;
+  sourcePageIndex?: number;
   bandKind: BandKind;
-  archetype?: TablixArchetype;
   slug?: string;
+  containerKey?: string;
+  solverStrategy?: SolverStrategy;
+  geometricSignature?: ContainerGeometricSignature;
   pageBreakBefore?: boolean;
   keepTogether?: boolean;
   topIn: number;
@@ -442,7 +499,6 @@ export interface LayoutSectionSummary {
     | 'Tablix'
     | 'Clause-List'
     | 'Hybrid-Callout';
-  archetype?: TablixArchetype;
   rowCount?: number;
   colCount?: number;
   hasNestedTablixes?: boolean;
@@ -452,6 +508,9 @@ export interface LayoutSectionSummary {
   hasRightColumn: boolean;
   hasFooterBand: boolean;
   childItemCount: number;
+  containerKey?: string;
+  solverStrategy?: SolverStrategy;
+  geometricSignature?: ContainerGeometricSignature;
 }
 
 export interface RdlcDocumentHierarchy {
@@ -599,9 +658,206 @@ export interface ConversionMetrics {
   printOnFirstPage?: boolean;
   nativeHeaderPresent?: boolean;
   nativeFooterPresent?: boolean;
-  archetypes?: { A: number; B: number; C: number; D: number };
   collisionsCount?: number;
+  clippedRowsCount?: number;
   renderedPageCount?: number;
+  sourcePageCount?: number;
+  pageSpilloverCount?: number;
+  pageParityDiagnostics?: PageParityDiagnostic[];
+}
+
+export interface CompilerWeights {
+  baselineYTolPt: number;
+  justifyGapRatio: number;
+  markerGapRatio: number;
+  spaceGapRatio: number;
+  bannerLuminanceMax: number;
+  fullWidthBannerRatio: number;
+  minCenterGutterPt: number;
+  hDividerMinWidthRatio: number;
+  xClusterTolPt: number;
+  yRowClusterTolPt: number;
+  paragraphLeadingRatio: number;
+  leftAnchorTolPt: number;
+  charWidthFactor: number;
+  lineHeightMultiplier: number;
+  cellPadVerticalPt: number;
+  cellPadHorizontalPt: number;
+  sectionGapPt: number;
+}
+
+export const DEFAULT_COMPILER_WEIGHTS: CompilerWeights = {
+  baselineYTolPt: 1.5,
+  justifyGapRatio: 1.8,
+  markerGapRatio: 0.35,
+  spaceGapRatio: 0.18,
+  bannerLuminanceMax: 242,
+  fullWidthBannerRatio: 0.7,
+  minCenterGutterPt: 6,
+  hDividerMinWidthRatio: 0.85,
+  xClusterTolPt: 4,
+  yRowClusterTolPt: 3.5,
+  paragraphLeadingRatio: 1.65,
+  leftAnchorTolPt: 5,
+  charWidthFactor: 0.5,
+  lineHeightMultiplier: 1.4,
+  cellPadVerticalPt: 4,
+  cellPadHorizontalPt: 4,
+  sectionGapPt: 6,
+};
+
+export interface ForbidColumnSplitConstraint {
+  pageNumber: number;
+  xMinPt: number;
+  xMaxPt: number;
+  yMinPt: number;
+  yMaxPt: number;
+}
+
+export interface ForceSplitYConstraint {
+  pageNumber: number;
+  yPt: number;
+}
+
+export interface ContainerStrategyOverride {
+  containerKey: string;
+  pageNumber: number;
+  strategy: SolverStrategy;
+  xRangePt?: [number, number];
+  yRangePt?: [number, number];
+  reason?: string;
+}
+
+export type PageSpilloverCause =
+  | 'NARROW_COLUMN_WRAP'
+  | 'OVER_SPLIT_ROWS'
+  | 'EXCESS_ROW_HEIGHT';
+
+export interface PageParityDiagnostic {
+  pageNumber: number;
+  tablixName: string;
+  containerKey?: string;
+  cause: PageSpilloverCause;
+  detail: string;
+  renderedPageSpan?: number;
+  compiledHeightPt?: number;
+  availableBodyHeightPt?: number;
+  repaired?: boolean;
+}
+
+export interface PageDensityOverride {
+  pageNumber: number;
+  cellPadVerticalPt?: number;
+  lineHeightMultiplier?: number;
+  minRowHeightPt?: number;
+  sectionGapPt?: number;
+  mergeOverSplitRows?: boolean;
+  extendTrailingColSpan?: boolean;
+}
+
+export interface SplitTwinSubTableConstraint {
+  pageNumber: number;
+  yMinPt: number;
+  yMaxPt: number;
+  gutterXPt: number;
+}
+
+export interface ForceUnifiedTableBandConstraint {
+  pageNumber: number;
+  yMinPt: number;
+  yMaxPt: number;
+}
+
+export interface CalibrationConstraints {
+  forbidColumnSplits: ForbidColumnSplitConstraint[];
+  forceTablixSplitsY: ForceSplitYConstraint[];
+  forceRowSplitsY: ForceSplitYConstraint[];
+  strategyOverrides?: ContainerStrategyOverride[];
+  pageOverrides?: PageDensityOverride[];
+  splitTwinSubTables?: SplitTwinSubTableConstraint[];
+  forceUnifiedTableBands?: ForceUnifiedTableBandConstraint[];
+}
+
+export interface OffendingContainerHint {
+  containerKey: string;
+  tablixName: string;
+  pageNumber: number;
+  issue: 'TEXT_SLICED' | 'COLUMN_BLEED' | 'ROW_OVERLAP';
+  currentStrategy?: SolverStrategy;
+}
+
+export interface CalibrationLossBreakdown {
+  totalLoss: number;
+  overlapCount: number;
+  clippedRowCount: number;
+  slicedTextCount: number;
+  columnBleedCount: number;
+  rowOverlapCount: number;
+  pageSpilloverCount: number;
+  meanDeltaY: number;
+  meanLineCountDelta: number;
+  pixelDiffRatio: number;
+  validationErrorsCount: number;
+  pageParityDiagnostics?: PageParityDiagnostic[];
+  diagnosticHints: {
+    slicedBoxes: ForbidColumnSplitConstraint[];
+    bleedSplitsY: ForceSplitYConstraint[];
+    collisionSplitsY: ForceSplitYConstraint[];
+    offendingContainers: OffendingContainerHint[];
+    twinSubTableSplits?: SplitTwinSubTableConstraint[];
+    unifiedTableBands?: ForceUnifiedTableBandConstraint[];
+  };
+}
+
+export interface CalibrationRoundTrace {
+  round: number;
+  totalLoss: number;
+  jointLoss: number;
+  deltaLoss: number;
+  overlapCount: number;
+  clippedRowCount: number;
+  slicedTextCount: number;
+  meanDeltaY: number;
+  meanLineCountDelta: number;
+  pixelDiffRatio: number;
+  switchedStrategies?: ContainerStrategyOverride[];
+  actionSummary: string;
+}
+
+export interface PinnedCalibrationDoc {
+  id: string;
+  documentName: string;
+  pinnedAt: string;
+  pageCount: number;
+  lastLoss: number;
+  layoutModel: IntermediateLayoutModel;
+}
+
+export interface CalibrationCheckpoint {
+  version: number;
+  updatedAt: string;
+  weights: CompilerWeights;
+  constraints: CalibrationConstraints;
+  pinnedCorpus: Array<{
+    id: string;
+    documentName: string;
+    pinnedAt: string;
+    pageCount: number;
+    lastLoss: number;
+  }>;
+}
+
+export interface CalibrationRunSummary {
+  converged: boolean;
+  iterationsRun: number;
+  initialLoss: number;
+  finalLoss: number;
+  initialJointLoss: number;
+  finalJointLoss: number;
+  weights: CompilerWeights;
+  constraints: CalibrationConstraints;
+  lossBreakdown: CalibrationLossBreakdown;
+  rounds: CalibrationRoundTrace[];
 }
 
 export interface PipelineRunResult {
@@ -623,4 +879,5 @@ export interface PipelineRunResult {
   logs: LogEntry[];
   finalized: boolean;
   agentIterations: number;
+  calibrationSummary?: CalibrationRunSummary;
 }

@@ -9,7 +9,6 @@ import {
   RegionStyle,
   ReportFieldDef,
   StructuredLogger,
-  TablixArchetype,
   TablixCell,
   TablixRegion,
   TablixRow,
@@ -639,7 +638,6 @@ export class V3TablixCompiler {
         widthIn: compiled.tablix.widthIn,
         heightIn: compiled.tablix.heightIn,
         layoutType: compiled.layoutType,
-        archetype: compiled.archetype,
         rowCount: compiled.tablix.rows.length,
         colCount: compiled.tablix.columnWidthsIn.length,
         hasNestedTablixes: false,
@@ -680,12 +678,6 @@ export class V3TablixCompiler {
       printOnFirstPage: pageHeaderSpec?.printOnFirstPage,
       hasPageFooter: Boolean(pageFooterSpec),
       bodyTablixes: bodyTablixes.length,
-      archetypes: {
-        A: sectionSummaries.filter((s) => s.archetype === 'A').length,
-        B: sectionSummaries.filter((s) => s.archetype === 'B').length,
-        C: sectionSummaries.filter((s) => s.archetype === 'C').length,
-        D: sectionSummaries.filter((s) => s.archetype === 'D').length,
-      },
     });
 
     return {
@@ -1804,7 +1796,6 @@ export class V3TablixCompiler {
     bodyMedianFontPt: number
   ): {
     tablix: TablixRegion;
-    archetype: TablixArchetype;
     layoutType: LayoutSectionSummary['layoutType'];
     columnCount: number;
     childItemCount: number;
@@ -1833,7 +1824,6 @@ export class V3TablixCompiler {
         ...repeatingTbl,
         id: tablixName,
         name: tablixName,
-        archetype: 'A',
         pageBreakBefore: block.pageBreakBefore,
         topIn: roundIn(topIn),
         leftIn: roundIn(blockLeft),
@@ -1844,7 +1834,6 @@ export class V3TablixCompiler {
       };
       return {
         tablix: cloned,
-        archetype: 'A',
         layoutType: 'Tablix',
         columnCount: cloned.columnWidthsIn.length,
         childItemCount: cloned.rows.length,
@@ -1872,7 +1861,6 @@ export class V3TablixCompiler {
         name: tablixName,
         pageNumber: block.pageNumber,
         bandKind: 'Detail',
-        archetype: 'A',
         pageBreakBefore: block.pageBreakBefore,
         keepTogether: false,
         topIn: roundIn(topIn),
@@ -1894,7 +1882,6 @@ export class V3TablixCompiler {
       };
       return {
         tablix,
-        archetype: 'A',
         layoutType: 'Single-Column',
         columnCount: 1,
         childItemCount: 1,
@@ -1970,7 +1957,6 @@ export class V3TablixCompiler {
         name: tablixName,
         pageNumber: block.pageNumber,
         bandKind: 'Detail',
-        archetype: 'D',
         pageBreakBefore: block.pageBreakBefore,
         keepTogether: false,
         topIn: roundIn(topIn),
@@ -1985,7 +1971,6 @@ export class V3TablixCompiler {
       };
       return {
         tablix,
-        archetype: 'D',
         layoutType: 'Hybrid-Callout',
         columnCount: 1,
         childItemCount: flat.rectangles.length + flat.images.length + flat.textboxes.length,
@@ -2408,7 +2393,6 @@ export class V3TablixCompiler {
     const hasClauses = logicalRows.some((r) =>
       r.items.length >= 2 && STANDALONE_MARKER_RE.test((r.items[0].region?.text ?? '').trim())
     );
-    const archetype: TablixArchetype = isDataTable ? 'A' : hasClauses ? 'B' : 'A';
     const layoutType: LayoutSectionSummary['layoutType'] = isDataTable
       ? 'Tablix'
       : hasClauses
@@ -2422,7 +2406,6 @@ export class V3TablixCompiler {
       name: tablixName,
       pageNumber: block.pageNumber,
       bandKind: block.isFootnote ? 'Notes' : 'Detail',
-      archetype,
       pageBreakBefore: block.pageBreakBefore,
       keepTogether: false,
       topIn: roundIn(topIn),
@@ -2438,7 +2421,6 @@ export class V3TablixCompiler {
 
     return {
       tablix,
-      archetype,
       layoutType,
       columnCount: columnWidthsIn.length,
       childItemCount: tablixRows.length,

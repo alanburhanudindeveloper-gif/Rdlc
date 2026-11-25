@@ -18,8 +18,35 @@ import { ArtifactsPanel, ArtifactTab } from './ui/ArtifactsPanel.tsx';
 import { ConversionStudio } from './ui/ConversionStudio.tsx';
 import { LayoutInspector } from './ui/LayoutInspector.tsx';
 import { ProposalWorkspace } from './ui/ProposalWorkspace.tsx';
-import { FrontendPipelineResult } from './ui/types.ts';
+import {
+  CalibrationCheckpoint,
+  DEFAULT_FRONTEND_WEIGHTS,
+  FrontendPipelineResult,
+  MlEngineStatus,
+  MlRunSummary,
+  MlTrainingEpoch,
+  PinnedCalibrationDoc,
+} from './ui/types.ts';
 import { VerificationPanel } from './ui/VerificationPanel.tsx';
+
+const CHECKPOINT_STORAGE_KEY = 'reportgen_calibration_checkpoint_v1';
+const CORPUS_STORAGE_KEY = 'reportgen_pinned_corpus_v1';
+
+function createDefaultCheckpoint(): CalibrationCheckpoint {
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    weights: { ...DEFAULT_FRONTEND_WEIGHTS },
+    constraints: {
+      forbidColumnSplits: [],
+      forceTablixSplitsY: [],
+      forceRowSplitsY: [],
+      strategyOverrides: [],
+      pageOverrides: [],
+    },
+    pinnedCorpus: [],
+  };
+}
 
 type NavSection = 'proposal' | 'workbench' | 'layout' | 'artifacts' | 'verification' | 'mcp';
 
@@ -51,8 +78,74 @@ export default function App() {
   const [schemaVersion, setSchemaVersion] = useState<'2008' | '2016'>('2008');
 
   const [running, setRunning] = useState(false);
+  const [calibrating, setCalibrating] = useState(false);
+  const [mlStatus, setMlStatus] = useState<MlEngineStatus | null>(null);
+  const [mlRunning, setMlRunning] = useState(false);
+  const [mlMode, setMlMode] = useState<'train' | 'infer' | null>(null);
+  const [mlEpochs, setMlEpochs] = useState<MlTrainingEpoch[]>([]);
+  const [mlRunSummary, setMlRunSummary] = useState<MlRunSummary | null>(null);
+  const [mlError, setMlError] = useState<string | null>(null);
+  const [lastUsedFixture, setLastUsedFixture] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<FrontendPipelineResult | null>(null);
+
+  const [checkpoint, setCheckpoint] = useState<CalibrationCheckpoint>(() => {
+    try {
+      const raw = localStorage.getItem(CHECKPOINT_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as CalibrationCheckpoint;
+        if (parsed && parsed.weights && parsed.constraints) {
+          return {
+            version: parsed.version ?? 1,
+            updatedAt: parsed.updatedAt ?? new Date().toISOString(),
+            weights: { ...DEFAULT_FRONTEND_WEIGHTS, ...parsed.weights },
+            constraints: {
+              forbidColumnSplits: parsed.constraints.forbidColumnSplits ?? [],
+              forceTablixSplitsY: parsed.constraints.forceTablixSplitsY ?? [],
+              forceRowSplitsY: parsed.constraints.forceRowSplitsY ?? [],
+              strategyOverrides: parsed.constraints.strategyOverrides ?? [],
+              pageOverrides: parsed.constraints.pageOverrides ?? [],
+            },
+            pinnedCorpus: parsed.pinnedCorpus ?? [],
+          };
+        }
+      }
+    } catch {
+      // Ignore malformed checkpoint
+    }
+    return createDefaultCheckpoint();
+  });
+
+  const [pinnedDocs, setPinnedDocs] = useState<PinnedCalibrationDoc[]>(() => {
+    try {
+      const raw = localStorage.getItem(CORPUS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed as PinnedCalibrationDoc[];
+      }
+    } catch {
+      // Ignore malformed corpus
+    }
+    return [];
+  });
+
+  const persistCheckpoint = (next: CalibrationCheckpoint) => {
+    setCheckpoint(next);
+    try {
+      localStorage.setItem(CHECKPOINT_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage quota errors
+    }
+  };
+
+  const persistPinnedDocs = (nextDocs: PinnedCalibrationDoc[]) => {
+    setPinnedDocs(nextDocs);
+    try {
+      localStorage.setItem(CORPUS_STORAGE_KEY, JSON.stringify(nextDocs));
+    } catch {
+      // Ignore storage quota errors
+    }
+  };
 
   const [skills, setSkills] = useState<SkillMeta[]>([]);
   const [mcpTools, setMcpTools] = useState<McpToolMeta[]>([]);
@@ -79,17 +172,29 @@ export default function App() {
   const [downloadingStagedPdf, setDownloadingStagedPdf] = useState(false);
   const [artifactsInitialTab, setArtifactsInitialTab] = useState<ArtifactTab>('rdlc');
 
+  const refreshMlStatus = async () => {
+    try {
+      const resp = await fetch('/api/ml/status');
+      const data = (await resp.json()) as MlEngineStatus;
+      setMlStatus(data);
+    } catch {
+      // Ignore transient ML status check error
+    }
+  };
+
   useEffect(() => {
     Promise.all([
       fetch('/api/skills').then((r) => r.json()).catch(() => ({ skills: [] })),
       fetch('/api/mcp/tools').then((r) => r.json()).catch(() => ({ tools: [] })),
       fetch('/api/config').then((r) => r.json()).catch(() => null),
       fetch('/api/outputs').then((r) => r.json()).catch(() => ({ outputs: [] })),
-    ]).then(([s, m, c, o]) => {
+      fetch('/api/ml/status').then((r) => r.json()).catch(() => null),
+    ]).then(([s, m, c, o, ml]) => {
       setSkills(s.skills ?? []);
       setMcpTools(m.tools ?? []);
       setConfigData(c);
       setStagedOutputs(o?.outputs ?? []);
+      if (ml) setMlStatus(ml as MlEngineStatus);
     });
   }, []);
 
@@ -146,11 +251,14 @@ export default function App() {
       return;
     }
     setRunning(true);
+    setLastUsedFixture(useFixture);
     setError(null);
     try {
       const form = new FormData();
       form.append('useFixture', String(useFixture));
       form.append('schemaVersion', schemaVersion);
+      form.append('weights', JSON.stringify(checkpoint.weights));
+      form.append('calibrationConstraints', JSON.stringify(checkpoint.constraints));
       if (!useFixture && pdfFile) {
         form.append('pdf', pdfFile);
         const buf = await pdfFile.arrayBuffer();
@@ -177,6 +285,269 @@ export default function App() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setRunning(false);
+    }
+  };
+
+  const handleAutoCalibrate = async () => {
+    if (!result) return;
+    setCalibrating(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append('useFixture', String(lastUsedFixture));
+      form.append('schemaVersion', schemaVersion);
+      form.append('weights', JSON.stringify(checkpoint.weights));
+      form.append('calibrationConstraints', JSON.stringify(checkpoint.constraints));
+      form.append('pinnedDocs', JSON.stringify(pinnedDocs));
+      if (!lastUsedFixture && pdfFile) {
+        form.append('pdf', pdfFile);
+      } else if (!lastUsedFixture && originalPdfBase64) {
+        form.append('originalPdfBase64', originalPdfBase64);
+      } else if (!lastUsedFixture) {
+        form.append('layoutModel', JSON.stringify(result.layoutModel));
+      }
+      if (rdlcFile) form.append('existingRdlc', rdlcFile);
+      if (vbFile) form.append('existingVb', vbFile);
+      if (excelFile) form.append('excel', excelFile);
+
+      const resp = await fetch('/api/pipeline/calibrate', { method: 'POST', body: form });
+      const data = (await parseJsonSafe(resp)) as FrontendPipelineResult & { error?: string };
+      if (!resp.ok) {
+        throw new Error(data.error ?? 'Auto-calibration failed');
+      }
+      setResult(data);
+      if (data.calibrationSummary) {
+        persistCheckpoint({
+          ...checkpoint,
+          updatedAt: new Date().toISOString(),
+          weights: data.calibrationSummary.weights,
+          constraints: data.calibrationSummary.constraints,
+        });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCalibrating(false);
+    }
+  };
+
+  const currentDocId = result
+    ? `${result.documentName}:${result.layoutModel.document.pageCount}`
+    : '';
+  const isCurrentPinned = Boolean(
+    currentDocId && checkpoint.pinnedCorpus.some((d) => d.id === currentDocId)
+  );
+
+  const handleTogglePinCurrent = () => {
+    if (!result) return;
+    if (isCurrentPinned) {
+      persistPinnedDocs(pinnedDocs.filter((d) => d.id !== currentDocId));
+      persistCheckpoint({
+        ...checkpoint,
+        updatedAt: new Date().toISOString(),
+        pinnedCorpus: checkpoint.pinnedCorpus.filter((d) => d.id !== currentDocId),
+      });
+      return;
+    }
+    const strippedLayout = {
+      ...result.layoutModel,
+      pages: result.layoutModel.pages.map((p) => ({
+        ...p,
+        rasterPreviewBase64: undefined,
+      })),
+    };
+    const pinnedAt = new Date().toISOString();
+    const lastLoss = result.calibrationSummary?.finalLoss ?? 0;
+    const newDoc: PinnedCalibrationDoc = {
+      id: currentDocId,
+      documentName: result.documentName,
+      pinnedAt,
+      pageCount: result.layoutModel.document.pageCount,
+      lastLoss,
+      layoutModel: strippedLayout,
+    };
+    persistPinnedDocs([...pinnedDocs.filter((d) => d.id !== currentDocId), newDoc]);
+    persistCheckpoint({
+      ...checkpoint,
+      updatedAt: pinnedAt,
+      pinnedCorpus: [
+        ...checkpoint.pinnedCorpus.filter((d) => d.id !== currentDocId),
+        {
+          id: currentDocId,
+          documentName: result.documentName,
+          pinnedAt,
+          pageCount: result.layoutModel.document.pageCount,
+          lastLoss,
+        },
+      ],
+    });
+  };
+
+  const handleResetWeights = () => {
+    const fresh = createDefaultCheckpoint();
+    fresh.pinnedCorpus = checkpoint.pinnedCorpus;
+    persistCheckpoint(fresh);
+  };
+
+  const handleExportCheckpoint = () => {
+    const blob = new Blob([JSON.stringify(checkpoint, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `calibration-checkpoint-v${checkpoint.version}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportCheckpoint = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result ?? '')) as CalibrationCheckpoint;
+        if (!parsed || !parsed.weights || !parsed.constraints) {
+          throw new Error('Invalid calibration checkpoint JSON');
+        }
+        persistCheckpoint({
+          version: parsed.version ?? 1,
+          updatedAt: new Date().toISOString(),
+          weights: { ...DEFAULT_FRONTEND_WEIGHTS, ...parsed.weights },
+          constraints: {
+            forbidColumnSplits: parsed.constraints.forbidColumnSplits ?? [],
+            forceTablixSplitsY: parsed.constraints.forceTablixSplitsY ?? [],
+            forceRowSplitsY: parsed.constraints.forceRowSplitsY ?? [],
+            strategyOverrides: parsed.constraints.strategyOverrides ?? [],
+          },
+          pinnedCorpus: parsed.pinnedCorpus ?? checkpoint.pinnedCorpus,
+        });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const runMlPolicy = async (mode: 'train' | 'infer') => {
+    if (!result) return;
+    setMlRunning(true);
+    setMlMode(mode);
+    setMlError(null);
+    setMlEpochs([]);
+    setMlRunSummary(null);
+    try {
+      const form = new FormData();
+      form.append('useFixture', String(lastUsedFixture));
+      form.append('schemaVersion', schemaVersion);
+      form.append('maxEpochs', mode === 'train' ? '12' : '8');
+      form.append('targetSsim', '0.95');
+      form.append('stream', 'true');
+      form.append('documentName', result.documentName);
+      if (!lastUsedFixture && pdfFile) {
+        form.append('pdf', pdfFile);
+      } else if (!lastUsedFixture && originalPdfBase64) {
+        form.append('originalPdfBase64', originalPdfBase64);
+      }
+
+      const resp = await fetch(`/api/ml/${mode}`, {
+        method: 'POST',
+        headers: { Accept: 'application/x-ndjson' },
+        body: form,
+      });
+
+      if (!resp.ok) {
+        const data = (await parseJsonSafe(resp)) as {
+          error?: string;
+          installCommand?: string;
+          missingPackages?: string[];
+        };
+        const msg = data.installCommand
+          ? `${data.error} Run: ${data.installCommand}`
+          : data.error ?? `ML ${mode} failed`;
+        throw new Error(msg);
+      }
+
+      if (!resp.body) {
+        const summary = (await parseJsonSafe(resp)) as MlRunSummary;
+        setMlRunSummary(summary);
+        setMlEpochs(summary.epochs ?? []);
+        if (summary.pipelineResult) setResult(summary.pipelineResult);
+        await refreshMlStatus();
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          try {
+            const evt = JSON.parse(line) as { event: string; data: unknown };
+            if (evt.event === 'epoch') {
+              setMlEpochs((prev) => [...prev, evt.data as MlTrainingEpoch]);
+            } else if (evt.event === 'complete') {
+              const summary = evt.data as MlRunSummary;
+              setMlRunSummary(summary);
+              if (Array.isArray(summary.epochs)) setMlEpochs(summary.epochs);
+              if (summary.pipelineResult) setResult(summary.pipelineResult);
+            } else if (evt.event === 'error') {
+              const errData = evt.data as { error?: string };
+              throw new Error(errData.error ?? `ML ${mode} failed`);
+            }
+          } catch (parseErr) {
+            if (parseErr instanceof Error && !line.startsWith('{')) continue;
+            throw parseErr;
+          }
+        }
+      }
+      await refreshMlStatus();
+    } catch (err) {
+      setMlError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMlRunning(false);
+      setMlMode(null);
+    }
+  };
+
+  const handleExportMlCheckpoint = async () => {
+    setMlError(null);
+    try {
+      const resp = await fetch('/api/ml/checkpoint/export');
+      if (!resp.ok) {
+        const data = (await parseJsonSafe(resp)) as { error?: string };
+        throw new Error(data.error ?? 'Failed to export PyTorch checkpoint');
+      }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'layout_policy.pt';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setMlError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleImportMlCheckpoint = async (file: File) => {
+    setMlError(null);
+    try {
+      const form = new FormData();
+      form.append('checkpoint', file);
+      const resp = await fetch('/api/ml/checkpoint/import', { method: 'POST', body: form });
+      const data = (await parseJsonSafe(resp)) as { error?: string; status?: MlEngineStatus };
+      if (!resp.ok) throw new Error(data.error ?? 'Failed to upload .pt checkpoint');
+      if (data.status) setMlStatus(data.status);
+      else await refreshMlStatus();
+    } catch (err) {
+      setMlError(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -534,7 +905,28 @@ export default function App() {
               {/* Execution Summary, Side-by-Side Studio & Logs */}
               {result && (
                 <div className="space-y-6">
-                  <ConversionStudio result={result} originalPdfBase64={originalPdfBase64} />
+                  <ConversionStudio
+                    result={result}
+                    originalPdfBase64={originalPdfBase64}
+                    checkpoint={checkpoint}
+                    isPinned={isCurrentPinned}
+                    calibrating={calibrating}
+                    onAutoCalibrate={handleAutoCalibrate}
+                    onTogglePinCurrent={handleTogglePinCurrent}
+                    onResetWeights={handleResetWeights}
+                    onExportCheckpoint={handleExportCheckpoint}
+                    onImportCheckpoint={handleImportCheckpoint}
+                    mlStatus={mlStatus}
+                    mlRunning={mlRunning}
+                    mlMode={mlMode}
+                    mlEpochs={mlEpochs}
+                    mlRunSummary={mlRunSummary}
+                    mlError={mlError}
+                    onTrainMlPolicy={() => void runMlPolicy('train')}
+                    onInferMlPolicy={() => void runMlPolicy('infer')}
+                    onExportMlCheckpoint={() => void handleExportMlCheckpoint()}
+                    onImportMlCheckpoint={(file) => void handleImportMlCheckpoint(file)}
+                  />
 
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     <div className="bg-white border border-slate-200 rounded-lg p-4">

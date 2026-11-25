@@ -16,6 +16,9 @@ import {
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import {
   BandKind,
+  CompilerWeights,
+  DEFAULT_COMPILER_WEIGHTS,
+  ExtractedVectorPrimitive,
   IntermediateLayoutModel,
   LayoutPage,
   LayoutRegion,
@@ -23,6 +26,7 @@ import {
   ReportGenError,
   ReportGenErrorCode,
   StructuredLogger,
+  VectorPrimitiveKind,
   VisualTextRun,
 } from '../core/types.ts';
 
@@ -216,8 +220,8 @@ function inferFontFlags(fontName: string, loadedFontName?: string): {
   return { family, bold, italic };
 }
 
-const TOP_HEADER_FRACTION = 0.12;
-const BOTTOM_FOOTER_FRACTION = 0.10;
+const TOP_HEADER_FRACTION = 0.13;
+const BOTTOM_FOOTER_FRACTION = 0.11;
 const GENERIC_PAGE_COUNTER_RE =
   /^(?:(?:.*?\s)?\b\d+\s*(?:\/|of|dari|from|sur|von)\s*\d+\b.*|(?:page|hal\.?|halaman|p\.?|pg\.?|seite)\s*\d+(?:\s*(?:\/|of|dari|from|sur|von)\s*\d+)?|\d{1,3})$/i;
 
@@ -616,8 +620,10 @@ export class PdfAnalyzer {
   public async analyzeBuffer(
     pdfBytes: Uint8Array,
     documentName: string,
-    dpi = 150
+    dpi = 150,
+    weightsOverride?: Partial<CompilerWeights>
   ): Promise<IntermediateLayoutModel> {
+    const weights: CompilerWeights = { ...DEFAULT_COMPILER_WEIGHTS, ...(weightsOverride ?? {}) };
     this.logger.info('PdfAnalysis', `PDF analysis started for "${documentName}"`, { dpi });
     try {
       const loadingTask = pdfjsLib.getDocument({
@@ -633,10 +639,21 @@ export class PdfAnalyzer {
       }
 
       // Layer 1: Extract native vector text & geometry first; never run OCR on digital PDFs
+      let lazy300DpiPreviews: Buffer[] | null = null;
+      const get300DpiPreviews = async (): Promise<Buffer[]> => {
+        if (lazy300DpiPreviews === null) {
+          lazy300DpiPreviews = await this.rasterizePagesWithGhostscript(pdfBytes, 300);
+        }
+        return lazy300DpiPreviews;
+      };
+
       let lazyPagePreviews: Buffer[] | null = null;
       const getPagePreviews = async (): Promise<Buffer[]> => {
         if (lazyPagePreviews === null) {
-          lazyPagePreviews = await this.rasterizePagesWithGhostscript(pdfBytes, dpi);
+          lazyPagePreviews =
+            dpi === 300
+              ? await get300DpiPreviews()
+              : await this.rasterizePagesWithGhostscript(pdfBytes, dpi);
         }
         return lazyPagePreviews;
       };
@@ -670,6 +687,7 @@ export class PdfAnalyzer {
         rawObjectCount: number;
         isDigitalVectorPage: boolean;
         vectorRects: RawVectorRect[];
+        vectorPrimitives: ExtractedVectorPrimitive[];
         imageBoxes: Array<{ x: number; y: number; width: number; height: number }>;
         complexClusterBoxes: Array<{ x: number; y: number; width: number; height: number; fallbackRect?: RawVectorRect }>;
         mergedLines: MergedTextLine[];
@@ -723,6 +741,37 @@ export class PdfAnalyzer {
           }
         }
 
+        const rawSpanBoxesIn = rawItems.map((it) => {
+          const tx = it.transform;
+          const fontSizePt = Math.max(5.5, Math.hypot(tx[0], tx[1]) || Math.hypot(tx[2], tx[3]) || 10);
+          const xPt = tx[4];
+          const yTopPt = viewport.height - tx[5] - fontSizePt * 0.85;
+          const wPt = Math.max(it.width || it.str.length * fontSizePt * weights.charWidthFactor, 4);
+          const hPt = Math.max(it.height || fontSizePt * 1.2, fontSizePt * 1.15);
+          return {
+            x: xPt / PT_PER_INCH,
+            y: Math.max(0, yTopPt / PT_PER_INCH),
+            width: wPt / PT_PER_INCH,
+            height: hPt / PT_PER_INCH,
+          };
+        });
+
+        // 300 DPI Text-Masked 1D RLE Morphological Primitive Detection before horizontal text merging
+        const hiResPages = await get300DpiPreviews();
+        const hiResPng = hiResPages[pageNum - 1];
+        const {
+          primitives: vectorPrimitives,
+          augmentedRects,
+        } = await this.detectAndMergePrimitives(
+          pageNum,
+          hiResPng,
+          rawSpanBoxesIn,
+          widthIn,
+          heightIn,
+          vectorRects,
+          weights
+        );
+
         const {
           mergedLines,
           brokenGlyphSpans,
@@ -732,7 +781,8 @@ export class PdfAnalyzer {
           viewport.height,
           enrichedStyles,
           textColorEvents,
-          vectorRects
+          augmentedRects,
+          weights
         );
 
         rawPages.push({
@@ -740,9 +790,10 @@ export class PdfAnalyzer {
           widthIn,
           heightIn,
           viewportHeightPt: viewport.height,
-          rawObjectCount: rawItems.length + vectorRects.length + imageBoxes.length,
+          rawObjectCount: rawItems.length + augmentedRects.length + imageBoxes.length,
           isDigitalVectorPage,
-          vectorRects,
+          vectorRects: augmentedRects,
+          vectorPrimitives,
           imageBoxes,
           complexClusterBoxes,
           mergedLines,
@@ -1021,7 +1072,10 @@ export class PdfAnalyzer {
           if (w >= 0.15 && h >= 0.1) {
             logoTemplateIdx = pageIdx;
             headerLogoBoxIn = { x, y, width: w, height: h };
-            const highResPng = await this.rasterizeSinglePageWithGhostscript(pdfBytes, pageIdx + 1, 300);
+            const hiResList = await get300DpiPreviews();
+            const highResPng =
+              hiResList[pageIdx] ??
+              (await this.rasterizeSinglePageWithGhostscript(pdfBytes, pageIdx + 1, 300));
             headerLogoBase64 = await this.cropPageRegionToBase64(
               highResPng ?? (await getPagePreviews())[pageIdx],
               headerLogoBoxIn,
@@ -1038,17 +1092,25 @@ export class PdfAnalyzer {
         yIn: number,
         wIn: number,
         hIn: number,
-        bandKind: BandKind
+        bandKind: BandKind,
+        allowCompactNearBoundary = true
       ): boolean => {
-        if (!headerLogoBoxIn || !headerLogoBase64 || bandKind !== 'Header') return false;
+        if (!headerLogoBoxIn || !headerLogoBase64) return false;
         const tol = 6 / PT_PER_INCH;
         const cx = xIn + wIn / 2;
         const cy = yIn + hIn / 2;
-        return (
+        const centerInside =
           cx >= headerLogoBoxIn.x - tol &&
           cx <= headerLogoBoxIn.x + headerLogoBoxIn.width + tol &&
           cy >= headerLogoBoxIn.y - tol &&
-          cy <= headerLogoBoxIn.y + headerLogoBoxIn.height + tol
+          cy <= headerLogoBoxIn.y + headerLogoBoxIn.height + tol;
+        if (!centerInside) return false;
+        if (bandKind === 'Header') return true;
+        if (!allowCompactNearBoundary) return false;
+        // Also strip stray vector/font icon glyphs overlapping the logo bounding box on slight header-band jitter
+        return (
+          wIn <= headerLogoBoxIn.width * 1.2 + tol * 2 &&
+          hIn <= headerLogoBoxIn.height * 1.2 + tol * 2
         );
       };
 
@@ -1366,6 +1428,7 @@ export class PdfAnalyzer {
           rawObjectCount: bundle.rawObjectCount,
           regions,
           bands: [],
+          vectorPrimitives: bundle.vectorPrimitives,
           rasterPreviewBase64,
           brokenGlyphRegions,
           deduplicatedSpans: bundle.deduplicatedSpans,
@@ -1397,11 +1460,13 @@ export class PdfAnalyzer {
     pageHeightPt: number,
     styles: Record<string, { fontFamily?: string }>,
     textColorEvents: TextColorEvent[],
-    vectorRects: RawVectorRect[]
+    vectorRects: RawVectorRect[],
+    weights: CompilerWeights = DEFAULT_COMPILER_WEIGHTS
   ): {
     mergedLines: MergedTextLine[];
     brokenGlyphSpans: NormalizedSpan[];
     deduplicatedSpans: number;
+    rawSpanBoxesIn: Array<{ x: number; y: number; width: number; height: number }>;
   } {
     const matchTextColor = (x: number, y: number): string => {
       let sameLineColor: string | undefined;
@@ -1446,7 +1511,7 @@ export class PdfAnalyzer {
       const xPt = tx[4];
       const yBaselineIn = (pageHeightPt - tx[5]) / PT_PER_INCH;
       const yTopPt = pageHeightPt - tx[5] - fontSizePt * 0.85;
-      const wPt = Math.max(it.width || it.str.length * fontSizePt * 0.5, 4);
+      const wPt = Math.max(it.width || it.str.length * fontSizePt * weights.charWidthFactor, 4);
       const hPt = Math.max(it.height || fontSizePt * 1.2, fontSizePt * 1.15);
       const xIn = xPt / PT_PER_INCH;
       const yIn = Math.max(0, yTopPt / PT_PER_INCH);
@@ -1476,14 +1541,35 @@ export class PdfAnalyzer {
 
     const brokenGlyphSpans = rawSpans.filter((s) => s.brokenGlyph);
     const cleanSpans = rawSpans.filter((s) => !s.brokenGlyph);
+    const rawSpanBoxesIn = rawSpans.map((s) => ({
+      x: s.x,
+      y: s.y,
+      width: s.width,
+      height: s.height,
+    }));
 
-    const baselineTolIn = 1.5 / PT_PER_INCH;
-    cleanSpans.sort((a, b) => (Math.abs(a.baselineY - b.baselineY) <= baselineTolIn ? a.x - b.x : a.baselineY - b.baselineY));
+    const baselineTolIn = weights.baselineYTolPt / PT_PER_INCH;
+    // Transitive quantized visual baseline sorting: bucket by baselineY (<= baselineTolIn) then sort ascending X
+    const sortedByY = [...cleanSpans].sort((a, b) => a.baselineY - b.baselineY || a.x - b.x);
+    const baselineBuckets: NormalizedSpan[][] = [];
+    for (const sp of sortedByY) {
+      const lastBucket = baselineBuckets[baselineBuckets.length - 1];
+      if (lastBucket && Math.abs(sp.baselineY - lastBucket[0].baselineY) <= baselineTolIn) {
+        lastBucket.push(sp);
+      } else {
+        baselineBuckets.push([sp]);
+      }
+    }
+    const visuallySortedSpans: NormalizedSpan[] = [];
+    for (const bucket of baselineBuckets) {
+      bucket.sort((a, b) => a.x - b.x || a.baselineY - b.baselineY);
+      visuallySortedSpans.push(...bucket);
+    }
 
     // Step A: Deduplicate fake-bold / double-stroked / stacked duplicate spans
     const dedupedSpans: NormalizedSpan[] = [];
     let deduplicatedSpans = 0;
-    for (const cur of cleanSpans) {
+    for (const cur of visuallySortedSpans) {
       const curTrim = cur.text.trim();
       const maxVertDup = Math.max(0.025, (cur.fontSizePt / PT_PER_INCH) * 0.72);
       const dup = dedupedSpans.find(
@@ -1505,7 +1591,7 @@ export class PdfAnalyzer {
     // Step B: Merge contiguous horizontal spans on the same baseline (<= 1.5pt) decoupled from column X-boundaries.
     // Do NOT split justified words unless gap > fontSize * 1.8 or a vertical vector border sits inside the gap.
     // Exception: if a line starts with a list marker (1., 2., a., b., (1)) followed by gap > fontSize * 0.35, split [markerSpan, bodySpan].
-    const fixSingleSpanParenSpacing = (s: string): string => s.replace(/\)([A-Za-z]{2,})/g, ') $1');
+    const fixSingleSpanParenSpacing = (s: string): string => s.replace(/\)([A-Za-z0-9])/g, ') $1');
     const LIST_MARKER_START_RE = /^(\d+(?:\.\d+)*\.|\([a-z0-9]{1,3}\)|[a-z]\.|[•\u2022\-–])$/i;
 
     const vertBorderTolIn = 1 / PT_PER_INCH;
@@ -1549,7 +1635,7 @@ export class PdfAnalyzer {
         Boolean(prev) &&
         prevSpanCount === 1 &&
         LIST_MARKER_START_RE.test(prevTrimmed) &&
-        gapPt > prev!.fontSizePt * 0.35;
+        gapPt > prev!.fontSizePt * weights.markerGapRatio;
 
       const verticalBorderSplit =
         Boolean(prev) &&
@@ -1562,7 +1648,7 @@ export class PdfAnalyzer {
           Math.max(prev!.y + prev!.height, cur.y + cur.height)
         );
 
-      const maxMergeGapPt = prev ? prev.fontSizePt * 1.8 : 0;
+      const maxMergeGapPt = prev ? prev.fontSizePt * weights.justifyGapRatio : 0;
 
       const sameBaseline =
         sameBaselineY &&
@@ -1583,7 +1669,7 @@ export class PdfAnalyzer {
         const needsSpace =
           !lastRun.text.endsWith(' ') &&
           !curTextFixed.startsWith(' ') &&
-          (parenToAlnum || (!insideParenEdge && gapPt > prev.fontSizePt * 0.18));
+          (parenToAlnum || (!insideParenEdge && gapPt > prev.fontSizePt * weights.spaceGapRatio));
         const spacer = needsSpace ? ' ' : '';
 
         const sameRunStyle =
@@ -1648,7 +1734,291 @@ export class PdfAnalyzer {
       }
     }
 
-    return { mergedLines, brokenGlyphSpans, deduplicatedSpans };
+    return { mergedLines, brokenGlyphSpans, deduplicatedSpans, rawSpanBoxesIn };
+  }
+
+  private async detectAndMergePrimitives(
+    pageNum: number,
+    png300Buffer: Buffer | undefined,
+    rawSpanBoxesIn: Array<{ x: number; y: number; width: number; height: number }>,
+    pageWidthIn: number,
+    pageHeightIn: number,
+    vectorRects: RawVectorRect[],
+    weights: CompilerWeights
+  ): Promise<{
+    primitives: ExtractedVectorPrimitive[];
+    augmentedRects: RawVectorRect[];
+  }> {
+    const primitives: ExtractedVectorPrimitive[] = [];
+    const augmentedRects: RawVectorRect[] = [...vectorRects];
+    let seq = 1;
+
+    const addPrim = (
+      kind: VectorPrimitiveKind,
+      xIn: number,
+      yIn: number,
+      wIn: number,
+      hIn: number,
+      colorHex: string | undefined,
+      source: 'rle' | 'vector' | 'merged'
+    ) => {
+      primitives.push({
+        id: `p${pageNum}-prim-${seq++}`,
+        kind,
+        x: roundIn(xIn),
+        y: roundIn(yIn),
+        width: roundIn(wIn),
+        height: roundIn(hIn),
+        xPt: Math.round(xIn * PT_PER_INCH * 10) / 10,
+        yPt: Math.round(yIn * PT_PER_INCH * 10) / 10,
+        widthPt: Math.round(wIn * PT_PER_INCH * 10) / 10,
+        heightPt: Math.round(hIn * PT_PER_INCH * 10) / 10,
+        colorHex,
+        source,
+      });
+    };
+
+    const isLightFill = (hex?: string): boolean => {
+      if (!hex || hex.toUpperCase() === '#FFFFFF') return false;
+      const clean = hex.replace('#', '');
+      if (clean.length !== 6) return true;
+      const r = parseInt(clean.slice(0, 2), 16);
+      const g = parseInt(clean.slice(2, 4), 16);
+      const b = parseInt(clean.slice(4, 6), 16);
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      return lum > 150;
+    };
+
+    // Seed from native CTM vector rectangles/lines first
+    for (const vr of vectorRects) {
+      const wPt = vr.width * PT_PER_INCH;
+      const hPt = vr.height * PT_PER_INCH;
+      if (hPt <= 3.5 && wPt >= 10) {
+        addPrim('HLine', vr.x, vr.y, vr.width, Math.max(vr.height, 0.008), vr.strokeColor ?? vr.fillColor, 'vector');
+      } else if (wPt <= 3.5 && hPt >= 10) {
+        addPrim('VLine', vr.x, vr.y, Math.max(vr.width, 0.008), vr.height, vr.strokeColor ?? vr.fillColor, 'vector');
+      } else if (vr.fillColor && vr.fillColor.toUpperCase() !== '#FFFFFF' && wPt >= 36 && hPt >= 8 && hPt <= 70) {
+        const kind: VectorPrimitiveKind = isLightFill(vr.fillColor) ? 'RowFillBand' : 'FillBanner';
+        addPrim(kind, vr.x, vr.y, vr.width, vr.height, vr.fillColor, 'vector');
+      }
+    }
+
+    if (!png300Buffer) {
+      return { primitives, augmentedRects };
+    }
+
+    try {
+      const { PNG } = await import('pngjs');
+      const png = PNG.sync.read(png300Buffer);
+      const W = png.width;
+      const H = png.height;
+      const data = png.data;
+      const lumThresh = weights.bannerLuminanceMax;
+
+      // 1. Build foreground binary mask (luminance < bannerLuminanceMax) & mask out vector text boxes +3px
+      const fgMask = new Uint8Array(W * H);
+      for (let idx = 0, p = 0; idx < data.length; idx += 4, p++) {
+        const a = data[idx + 3];
+        if (a < 20) continue;
+        const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+        if (lum < lumThresh) {
+          fgMask[p] = 1;
+        }
+      }
+
+      const textCleared = new Uint8Array(W * H);
+      for (const tb of rawSpanBoxesIn) {
+        const x0 = Math.max(0, Math.floor((tb.x / pageWidthIn) * W) - 3);
+        const x1 = Math.min(W - 1, Math.ceil(((tb.x + tb.width) / pageWidthIn) * W) + 3);
+        const y0 = Math.max(0, Math.floor((tb.y / pageHeightIn) * H) - 3);
+        const y1 = Math.min(H - 1, Math.ceil(((tb.y + tb.height) / pageHeightIn) * H) + 3);
+        for (let y = y0; y <= y1; y++) {
+          const rowOff = y * W;
+          for (let x = x0; x <= x1; x++) {
+            fgMask[rowOff + x] = 0;
+            textCleared[rowOff + x] = 1;
+          }
+        }
+      }
+
+      const sampleColor = (x0: number, y0: number, x1: number, y1: number): string => {
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+        let cnt = 0;
+        const stepX = Math.max(1, Math.floor((x1 - x0) / 16));
+        const stepY = Math.max(1, Math.floor((y1 - y0) / 8));
+        for (let y = y0; y <= y1; y += stepY) {
+          for (let x = x0; x <= x1; x += stepX) {
+            const p = y * W + x;
+            if (fgMask[p] === 1 && textCleared[p] === 0) {
+              const off = p * 4;
+              sumR += data[off];
+              sumG += data[off + 1];
+              sumB += data[off + 2];
+              cnt++;
+            }
+          }
+        }
+        if (cnt === 0) return '#CBD5E1';
+        return rgb255ToHex(sumR / cnt, sumG / cnt, sumB / cnt);
+      };
+
+      const mergeBox = (
+        boxes: Array<{ x0: number; y0: number; x1: number; y1: number }>,
+        x0: number,
+        y0: number,
+        x1: number,
+        y1: number,
+        tolX: number,
+        tolY: number
+      ) => {
+        for (const b of boxes) {
+          if (x0 <= b.x1 + tolX && x1 >= b.x0 - tolX && y0 <= b.y1 + tolY && y1 >= b.y0 - tolY) {
+            b.x0 = Math.min(b.x0, x0);
+            b.y0 = Math.min(b.y0, y0);
+            b.x1 = Math.max(b.x1, x1);
+            b.y1 = Math.max(b.y1, y1);
+            return;
+          }
+        }
+        boxes.push({ x0, y0, x1, y1 });
+      };
+
+      // 2. Horizontal 1D RLE pass: detect thin HLines & filled horizontal spans (FillBanner / RowFillBand)
+      const hLineBoxes: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+      const fillStripBoxes: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+      const minHRunPx = Math.round((10 / PT_PER_INCH) * (W / pageWidthIn));
+      const minFillWidthPx = Math.round((48 / PT_PER_INCH) * (W / pageWidthIn));
+
+      for (let y = 0; y < H; y++) {
+        const rowOff = y * W;
+        let x = 0;
+        while (x < W) {
+          if (fgMask[rowOff + x] === 1) {
+            const startX = x;
+            while (x < W) {
+              if (fgMask[rowOff + x] === 1) {
+                x++;
+              } else if (textCleared[rowOff + x] === 1) {
+                // Bridge across cleared text glyphs ONLY if solid ink resumes on the right
+                let k = x;
+                while (k < W && textCleared[rowOff + k] === 1 && k - x < minFillWidthPx * 2) k++;
+                if (k < W && fgMask[rowOff + k] === 1 && x - startX >= 4) {
+                  x = k;
+                } else {
+                  break;
+                }
+              } else {
+                break;
+              }
+            }
+            const runLen = x - startX;
+            if (runLen >= minHRunPx) {
+              // Check immediate vertical thickness around midpoint to distinguish 1..12px thin line vs taller banner strip
+              mergeBox(hLineBoxes, startX, y, x - 1, y, 4, 2);
+              if (runLen >= minFillWidthPx) {
+                mergeBox(fillStripBoxes, startX, y, x - 1, y, 6, 3);
+              }
+            }
+          } else {
+            x++;
+          }
+        }
+      }
+
+      // 3. Vertical 1D RLE pass: detect thin VLines
+      const vLineBoxes: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+      const minVRunPx = Math.round((10 / PT_PER_INCH) * (H / pageHeightIn));
+      for (let x = 0; x < W; x++) {
+        let y = 0;
+        while (y < H) {
+          if (fgMask[y * W + x] === 1) {
+            const startY = y;
+            while (y < H && fgMask[y * W + x] === 1) y++;
+            if (y - startY >= minVRunPx) {
+              mergeBox(vLineBoxes, x, startY, x, y - 1, 2, 4);
+            }
+          } else {
+            y++;
+          }
+        }
+      }
+
+      const maxLineThickPx = Math.max(8, Math.round((3.2 / PT_PER_INCH) * (W / pageWidthIn)));
+      const minBannerHeightPx = Math.round((10 / PT_PER_INCH) * (H / pageHeightIn));
+      const maxBannerHeightPx = Math.round((68 / PT_PER_INCH) * (H / pageHeightIn));
+
+      const hasMatchingVector = (xIn: number, yIn: number, wIn: number, hIn: number, kind: VectorPrimitiveKind): boolean => {
+        const tol = 6 / PT_PER_INCH;
+        return primitives.some(
+          (p) =>
+            p.kind === kind &&
+            Math.abs(p.x - xIn) <= tol &&
+            Math.abs(p.y - yIn) <= tol &&
+            Math.abs(p.width - wIn) <= tol * 2 &&
+            Math.abs(p.height - hIn) <= tol * 2
+        );
+      };
+
+      const mergeOrAddRle = (
+        kind: VectorPrimitiveKind,
+        x0: number,
+        y0: number,
+        x1: number,
+        y1: number
+      ) => {
+        const xIn = (x0 / W) * pageWidthIn;
+        const yIn = (y0 / H) * pageHeightIn;
+        const wIn = Math.max(0.008, ((x1 - x0 + 1) / W) * pageWidthIn);
+        const hIn = Math.max(0.008, ((y1 - y0 + 1) / H) * pageHeightIn);
+        const colorHex = sampleColor(x0, y0, x1, y1);
+
+        if (hasMatchingVector(xIn, yIn, wIn, hIn, kind)) {
+          return;
+        }
+        addPrim(kind, xIn, yIn, wIn, hIn, colorHex, 'rle');
+        augmentedRects.push({
+          x: xIn,
+          y: yIn,
+          width: wIn,
+          height: hIn,
+          strokeColor: kind === 'HLine' || kind === 'VLine' ? colorHex : undefined,
+          fillColor: kind === 'FillBanner' || kind === 'RowFillBand' ? colorHex : undefined,
+          lineWidthPt: kind === 'HLine' || kind === 'VLine' ? 0.75 : 0,
+        });
+      };
+
+      for (const b of hLineBoxes) {
+        const bh = b.y1 - b.y0 + 1;
+        const bw = b.x1 - b.x0 + 1;
+        if (bh <= maxLineThickPx && bw >= minHRunPx) {
+          mergeOrAddRle('HLine', b.x0, b.y0, b.x1, b.y1);
+        }
+      }
+
+      for (const b of vLineBoxes) {
+        const bw = b.x1 - b.x0 + 1;
+        const bh = b.y1 - b.y0 + 1;
+        if (bw <= maxLineThickPx && bh >= minVRunPx) {
+          mergeOrAddRle('VLine', b.x0, b.y0, b.x1, b.y1);
+        }
+      }
+
+      for (const b of fillStripBoxes) {
+        const bw = b.x1 - b.x0 + 1;
+        const bh = b.y1 - b.y0 + 1;
+        if (bw >= minFillWidthPx && bh >= minBannerHeightPx && bh <= maxBannerHeightPx) {
+          const colorHex = sampleColor(b.x0, b.y0, b.x1, b.y1);
+          const kind: VectorPrimitiveKind = isLightFill(colorHex) ? 'RowFillBand' : 'FillBanner';
+          mergeOrAddRle(kind, b.x0, b.y0, b.x1, b.y1);
+        }
+      }
+    } catch {
+      // Non-fatal fallback: keep CTM vector primitives
+    }
+
+    return { primitives, augmentedRects };
   }
 
   private extractVectorsAndImages(

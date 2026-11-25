@@ -1,7 +1,16 @@
 import crypto from 'crypto';
 import {
+  calibratePipeline,
+  enforceOneToOnePageParity,
+} from '../calibration/calibrationEngine.ts';
+import {
+  CalibrationConstraints,
+  CalibrationRunSummary,
+  CompilerWeights,
   ExistingProjectPattern,
+  IntermediateLayoutModel,
   LogicTestCase,
+  PinnedCalibrationDoc,
   PipelineRunResult,
   StructuredLogger,
 } from '../core/types.ts';
@@ -19,6 +28,11 @@ export interface AgentRunInput {
   customJsonTestCases?: LogicTestCase[];
   comparisonPdfBytes?: Uint8Array;
   schemaVersion?: '2008' | '2016';
+  weights?: Partial<CompilerWeights>;
+  calibrationConstraints?: CalibrationConstraints;
+  autoCalibrate?: boolean;
+  pinnedDocs?: PinnedCalibrationDoc[];
+  preAnalyzedLayout?: IntermediateLayoutModel;
 }
 
 /**
@@ -45,11 +59,14 @@ export class ReportGenAgent {
     const { config } = this.services;
 
     // Step 1: Analyze PDF deterministically (includes Layer 0 text-stripped backgrounds & broken glyph crops)
-    const rawLayout = await this.services.pdfAnalyzer.analyzeBuffer(
-      input.pdfBytes,
-      input.documentName,
-      config.pdf.dpi
-    );
+    const rawLayout = input.preAnalyzedLayout
+      ? input.preAnalyzedLayout
+      : await this.services.pdfAnalyzer.analyzeBuffer(
+          input.pdfBytes,
+          input.documentName,
+          config.pdf.dpi,
+          input.weights
+        );
 
     // Step 2: Inspect existing RDLC/VB project artifacts if provided
     let existingPattern: ExistingProjectPattern | undefined;
@@ -63,21 +80,61 @@ export class ReportGenAgent {
     }
 
     // Step 3: Reconstruct deterministic coordinate grids & bands
-    const layoutModel = this.services.gridReconstructor.reconstruct(
-      rawLayout,
-      config.pdf.coordinateTolerance
-    );
+    const layoutModel = input.preAnalyzedLayout
+      ? input.preAnalyzedLayout
+      : this.services.gridReconstructor.reconstruct(
+          rawLayout,
+          config.pdf.coordinateTolerance
+        );
 
-    // Step 4: Deterministic Flat-2008 or Dual-Layer 2016 Tablix generation & validation loop
+    // Step 4: Deterministic Flat-2008 or Shared-Layer-1-4 2016 Tablix generation & optional CEGIS calibration
     const schemaVersion: '2008' | '2016' = input.schemaVersion === '2016' ? '2016' : '2008';
     const is2008 = schemaVersion === '2008';
     const rdlcValidator = new RdlcValidator(this.logger);
-    let iterations = 0;
-    let reportDefinition = this.services.tablixBuilder.buildReportDefinition(
+    let activeWeights = input.weights;
+    let activeConstraints = input.calibrationConstraints;
+    let calibrationSummary: CalibrationRunSummary | undefined;
+
+    const prelimDefForDummy = this.services.tablixBuilder.buildReportDefinition(
       layoutModel,
       existingPattern,
-      { schemaVersion }
+      {
+        schemaVersion,
+        weights: activeWeights,
+        calibrationConstraints: activeConstraints,
+      }
     );
+    const prelimDummy = this.services.excelOracle.generateDummyJson(prelimDefForDummy);
+
+    if (input.autoCalibrate) {
+      calibrationSummary = calibratePipeline({
+        layoutModel,
+        schemaVersion,
+        initialWeights: activeWeights,
+        initialConstraints: activeConstraints,
+        pinnedDocs: input.pinnedDocs,
+        existingPattern,
+        dummyJson: prelimDummy,
+        logger: this.logger,
+      });
+      activeWeights = calibrationSummary.weights;
+      activeConstraints = calibrationSummary.constraints;
+    }
+
+    const parityResult = enforceOneToOnePageParity({
+      layoutModel,
+      schemaVersion,
+      existingPattern,
+      weights: activeWeights,
+      calibrationConstraints: activeConstraints,
+      dummyJson: prelimDummy,
+      logger: this.logger,
+    });
+    activeWeights = parityResult.weights;
+    activeConstraints = parityResult.constraints;
+
+    let iterations = 0;
+    let reportDefinition = parityResult.reportDef;
     let vbArtifacts = this.services.vbGenerator.generate(reportDefinition, existingPattern);
     let rdlcXml = this.services.rdlcGenerator.generate(
       reportDefinition,
@@ -92,7 +149,11 @@ export class ReportGenAgent {
       reportDefinition = this.services.tablixBuilder.buildReportDefinition(
         layoutModel,
         existingPattern,
-        { schemaVersion }
+        {
+          schemaVersion,
+          weights: activeWeights,
+          calibrationConstraints: activeConstraints,
+        }
       );
       vbArtifacts = this.services.vbGenerator.generate(reportDefinition, existingPattern);
       rdlcXml = this.services.rdlcGenerator.generate(
@@ -136,22 +197,40 @@ export class ReportGenAgent {
 
     // Step 7: Visual parity comparison (Original PDF vs Rendered RDLC PDF or supplied comparisonPdf)
     const comparisonTarget = input.comparisonPdfBytes ?? renderedPdfBytes;
-    const visualDiff = await this.services.visualDiff.comparePdfs(
-      input.pdfBytes,
-      comparisonTarget,
-      config.validation.visualSimilarityTarget,
-      undefined,
-      config.pdf.dpi
-    );
+    const visualDiff =
+      input.pdfBytes.byteLength > 0
+        ? await this.services.visualDiff.comparePdfs(
+            input.pdfBytes,
+            comparisonTarget,
+            config.validation.visualSimilarityTarget,
+            undefined,
+            config.pdf.dpi
+          )
+        : {
+            available: false,
+            targetSimilarity: config.validation.visualSimilarityTarget ?? 0.95,
+            overallSimilarity: 0,
+            overallParityPercent: 0,
+            meanAbsoluteError: 0,
+            note: 'Skipped visual diff: original PDF buffer not provided.',
+            pages: [],
+          };
 
-    // Final Validation Gate: validate XML structure + runtime page parity, 0 collisions, and 95%+ per-page parity
+    // Final Validation Gate: validate XML structure + runtime 1:1 page parity, 0 collisions, 0 clipped rows
     const targetPct = Math.round((config.validation.visualSimilarityTarget ?? 0.95) * 10000) / 100;
+    const pageSpilloverSummary = previewHtml.pageSpillovers.map(
+      (s) =>
+        `P${s.sourcePage}->${s.renderedPages}pp (${s.compiledHeightPt.toFixed(0)}/${s.availableBodyHeightPt.toFixed(0)}pt)`
+    );
     rdlcValidation = rdlcValidator.validate(rdlcXml, {
       requireRdlc2008: is2008,
       context: {
         sourcePageCount: layoutModel.document.pageCount,
         renderedPageCount: previewHtml.pageCount,
         collisionsCount: previewHtml.collisions.length,
+        clippedRowsCount: previewHtml.clippedRows.length,
+        pageSpilloverCount: previewHtml.pageSpillovers.length,
+        pageSpilloverSummary,
         perPageParity: visualDiff.available
           ? visualDiff.pages.map((p) => ({ page: p.page, parityPercent: p.parityPercent }))
           : undefined,
@@ -240,7 +319,6 @@ export class ReportGenAgent {
     let bodyTextboxCount = 0;
     let bodyTablixCount = 0;
     let nestedTablixCount = 0;
-    const archetypes = { A: 0, B: 0, C: 0, D: 0 };
 
     if (bodyTablixes.length > 0) {
       for (const bt of bodyTablixes) {
@@ -248,9 +326,6 @@ export class ReportGenAgent {
         bodyTextboxCount += c.textboxes;
         bodyTablixCount += c.tablixes;
         nestedTablixCount += c.nestedTablixes;
-        if (bt.archetype === 'A' || bt.archetype === 'B' || bt.archetype === 'C' || bt.archetype === 'D') {
-          archetypes[bt.archetype]++;
-        }
       }
     } else if (bodySections.length > 0) {
       for (const sec of bodySections) {
@@ -294,25 +369,40 @@ export class ReportGenAgent {
       printOnFirstPage: reportDefinition.pageHeaderSpec?.printOnFirstPage ?? false,
       nativeHeaderPresent: Boolean(reportDefinition.pageHeaderSpec),
       nativeFooterPresent: Boolean(reportDefinition.pageFooterSpec),
-      archetypes,
       collisionsCount: previewHtml.collisions.length,
+      clippedRowsCount: previewHtml.clippedRows.length,
+      sourcePageCount: layoutModel.document.pageCount,
       renderedPageCount: previewHtml.pageCount,
+      pageSpilloverCount: previewHtml.pageSpillovers.length,
+      pageParityDiagnostics: parityResult.pageParityDiagnostics,
     };
 
     const finalized =
       rdlcValidation.valid &&
+      previewHtml.collisions.length === 0 &&
+      previewHtml.clippedRows.length === 0 &&
+      previewHtml.pageSpillovers.length === 0 &&
+      previewHtml.pageCount === layoutModel.document.pageCount &&
       (!config.validation.requirePassingLogicTests || logicTests.status === 'PASS');
 
     if (finalized) {
-      this.logger.info('Finalize', 'Deterministic 15-point RDLC & Logic gates passed', {
+      this.logger.info('Finalize', 'Deterministic RDLC & Logic gates passed', {
         rdlcSha256: rdlcSha256.slice(0, 12),
         parityPercent: visualDiff.overallParityPercent,
         bodyTablixes: bodyTablixes.length,
         nestedTablixes: nestedTablixCount,
         collisions: previewHtml.collisions.length,
+        clippedRows: previewHtml.clippedRows.length,
+        sourcePages: layoutModel.document.pageCount,
+        renderedPages: previewHtml.pageCount,
       });
     } else {
-      this.logger.warn('Finalize', 'Report NOT finalized due to failed 15-point validation or logic gate', {
+      this.logger.warn('Finalize', 'Report NOT finalized due to failed quality, page parity, or logic gate', {
+        collisions: previewHtml.collisions.length,
+        clippedRows: previewHtml.clippedRows.length,
+        sourcePages: layoutModel.document.pageCount,
+        renderedPages: previewHtml.pageCount,
+        pageSpillovers: previewHtml.pageSpillovers.length,
         rdlcErrors: rdlcValidation.errors.map((e) => `${e.ruleId}: ${e.message}`),
       });
     }
@@ -336,6 +426,7 @@ export class ReportGenAgent {
       logs: this.logger.getEntries(),
       finalized,
       agentIterations: iterations + 1,
+      calibrationSummary,
     };
   }
 }
