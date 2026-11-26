@@ -229,6 +229,11 @@ interface LogicalSegmentBlock {
   banner?: BannerElement;
   items: PositionedItem[];
   forcedTopIn?: number;
+  nestedDual?: {
+    gutterXIn: number;
+    leftBlock: LogicalSegmentBlock;
+    rightBlock: LogicalSegmentBlock;
+  };
 }
 
 interface LogicalRowBucket {
@@ -277,15 +282,15 @@ function resolvePageCompilerWeights(
     ...weights,
     cellPadVerticalPt:
       override.cellPadVerticalPt !== undefined
-        ? Math.max(0.5, override.cellPadVerticalPt)
+        ? Math.max(0.25, override.cellPadVerticalPt)
         : weights.cellPadVerticalPt,
     lineHeightMultiplier:
       override.lineHeightMultiplier !== undefined
-        ? Math.max(1.06, override.lineHeightMultiplier)
+        ? Math.max(1.0, override.lineHeightMultiplier)
         : weights.lineHeightMultiplier,
     sectionGapPt:
       override.sectionGapPt !== undefined
-        ? Math.max(1.0, override.sectionGapPt)
+        ? Math.max(0.5, override.sectionGapPt)
         : weights.sectionGapPt,
   };
   return { pageWeights, override };
@@ -517,18 +522,154 @@ export class Flat2008TablixCompiler {
           ? { ...blk, pageBreakBefore: true }
           : blk;
 
-      const tablix = this.compileFlatMasterGridTablix(
-        tablixName,
-        effectiveBlock,
-        assignedTopIn,
-        dataSetName,
-        registerEmbeddedImage,
-        nextUniqueName,
-        primitivesByPage.get(blk.pageNumber) ?? [],
-        bodyTopOriginIn,
-        weights,
-        constraints
-      );
+      let tablix: TablixRegion;
+      let hasNestedChildren = false;
+      if (effectiveBlock.nestedDual && effectiveBlock.banner) {
+        const { pageWeights, override: pageOverride } = resolvePageCompilerWeights(
+          weights,
+          constraints,
+          effectiveBlock.pageNumber
+        );
+        const pagePrims = primitivesByPage.get(effectiveBlock.pageNumber) ?? [];
+        const leftChildRaw = this.compileFlatMasterGridTablix(
+          allocateTablixName(`${tablixName}_Left`),
+          { ...effectiveBlock.nestedDual.leftBlock, pageBreakBefore: false },
+          0,
+          dataSetName,
+          registerEmbeddedImage,
+          nextUniqueName,
+          pagePrims,
+          bodyTopOriginIn,
+          weights,
+          constraints
+        );
+        const rightChildRaw = this.compileFlatMasterGridTablix(
+          allocateTablixName(`${tablixName}_Right`),
+          { ...effectiveBlock.nestedDual.rightBlock, pageBreakBefore: false },
+          0,
+          dataSetName,
+          registerEmbeddedImage,
+          nextUniqueName,
+          pagePrims,
+          bodyTopOriginIn,
+          weights,
+          constraints
+        );
+        const leftChild: TablixRegion = {
+          ...leftChildRaw,
+          topIn: 0,
+          leftIn: 0,
+          pageBreakBefore: false,
+        };
+        const rightChild: TablixRegion = {
+          ...rightChildRaw,
+          topIn: 0,
+          leftIn: 0,
+          pageBreakBefore: false,
+        };
+        const leftColW = roundIn(Math.max(0.5, effectiveBlock.nestedDual.leftBlock.widthIn));
+        const rightColW = roundIn(Math.max(0.5, effectiveBlock.widthIn - leftColW));
+        const minBannerH = pageOverride?.minRowHeightPt ?? 14;
+        const bannerCell = this.buildBannerTextboxCell(
+          effectiveBlock.banner,
+          0,
+          0,
+          2,
+          nextUniqueName,
+          pageWeights
+        );
+        const bannerStyle =
+          bannerCell.content.kind === 'Textbox'
+            ? bannerCell.content.style
+            : defaultTextStyle(9.5, pageWeights);
+        const bannerH = roundIn(
+          Math.max(
+            ptToIn(minBannerH),
+            effectiveBlock.banner.height,
+            ptToIn(
+              estimateWrappedRowHeightPt(
+                [{ text: effectiveBlock.banner.titleText, style: bannerStyle, coveredWidthPt: inToPt(effectiveBlock.widthIn) }],
+                minBannerH,
+                pageWeights
+              )
+            )
+          )
+        );
+        const bodyRowH = roundIn(Math.max(ptToIn(14), leftChild.heightIn, rightChild.heightIn));
+        const outerH = roundIn(bannerH + bodyRowH);
+        tablix = {
+          id: tablixName,
+          name: tablixName,
+          pageNumber: effectiveBlock.pageNumber,
+          sourcePageIndex: effectiveBlock.pageNumber - 1,
+          bandKind: 'Detail',
+          containerKey,
+          solverStrategy: 'DUAL_TRACK_STREAM_SOLVER',
+          pageBreakBefore: effectiveBlock.pageBreakBefore,
+          keepTogether: false,
+          topIn: roundIn(assignedTopIn),
+          leftIn: roundIn(effectiveBlock.leftIn),
+          widthIn: roundIn(effectiveBlock.widthIn),
+          heightIn: outerH,
+          dataSetName,
+          isRepeatingDetail: false,
+          columnWidthsIn: [leftColW, rightColW],
+          rows: [
+            {
+              heightIn: bannerH,
+              isDetailRow: false,
+              cells: [
+                bannerCell,
+                {
+                  colIndex: 1,
+                  rowIndex: 0,
+                  colSpan: 1,
+                  rowSpan: 1,
+                  skipBecauseMerged: true,
+                  content: { kind: 'Empty', name: nextUniqueName('Empty') },
+                },
+              ],
+            },
+            {
+              heightIn: bodyRowH,
+              isDetailRow: false,
+              cells: [
+                {
+                  colIndex: 0,
+                  rowIndex: 1,
+                  colSpan: 1,
+                  rowSpan: 1,
+                  skipBecauseMerged: false,
+                  content: { kind: 'Tablix', name: leftChild.name, tablix: leftChild },
+                },
+                {
+                  colIndex: 1,
+                  rowIndex: 1,
+                  colSpan: 1,
+                  rowSpan: 1,
+                  skipBecauseMerged: false,
+                  content: { kind: 'Tablix', name: rightChild.name, tablix: rightChild },
+                },
+              ],
+            },
+          ],
+          zIndex: 1,
+        };
+        hasNestedChildren = true;
+      } else {
+        tablix = this.compileFlatMasterGridTablix(
+          tablixName,
+          effectiveBlock,
+          assignedTopIn,
+          dataSetName,
+          registerEmbeddedImage,
+          nextUniqueName,
+          primitivesByPage.get(blk.pageNumber) ?? [],
+          bodyTopOriginIn,
+          weights,
+          constraints
+        );
+      }
 
       if (tablix.rows.length === 0) {
         if (effectiveBlock.pageBreakBefore) {
@@ -560,14 +701,14 @@ export class Flat2008TablixCompiler {
         leftIn: tablix.leftIn,
         widthIn: tablix.widthIn,
         heightIn: tablix.heightIn,
-        layoutType: blk.track === 'full' ? 'Tablix' : 'Dual-Column',
+        layoutType: hasNestedChildren || blk.track !== 'full' ? 'Dual-Column' : 'Tablix',
         rowCount: tablix.rows.length,
         colCount: tablix.columnWidthsIn.length,
-        hasNestedTablixes: false,
+        hasNestedTablixes: hasNestedChildren,
         columnCount: tablix.columnWidthsIn.length,
         hasHeaderBand: Boolean(blk.banner),
-        hasLeftColumn: blk.track === 'left',
-        hasRightColumn: blk.track === 'right',
+        hasLeftColumn: hasNestedChildren || blk.track === 'left',
+        hasRightColumn: hasNestedChildren || blk.track === 'right',
         hasFooterBand: Boolean(blk.isFootnote),
         childItemCount: tablix.rows.length,
         containerKey: tablix.containerKey,
@@ -576,8 +717,8 @@ export class Flat2008TablixCompiler {
       });
     }
 
-    // Strict 1:1 Source-Page Anchor Enforcement (guaranteed 17 in === 17 out):
-    // Every page > 1 must have its PageBreak<Start> strictly on the FIRST non-right-track Tablix (full or left).
+    // [R-PB] Strict 1:1 Source-Page Anchor Enforcement (guaranteed N in === N out):
+    // Every page > 1 must have its PageBreak<Start> strictly on the single top-most (min(Top)) outer non-right-track Tablix.
     for (let pIdx = 0; pIdx < pages.length; pIdx++) {
       const pNum = pages[pIdx].pageNumber;
       const pageTbls = bodyTablixes.filter((t) => t.pageNumber === pNum);
@@ -586,11 +727,16 @@ export class Flat2008TablixCompiler {
       }
       if (pIdx === 0) continue;
 
-      const firstAnchor = pageTbls.find((t) => t.leftIn < maxBudgetWidthInCompile * 0.42);
+      const minTop = pageTbls.length > 0 ? Math.min(...pageTbls.map((t) => t.topIn)) : 0;
+      const topRowTbls = pageTbls
+        .filter((t) => t.topIn <= minTop + ptToIn(12))
+        .sort((a, b) => a.leftIn - b.leftIn || a.topIn - b.topIn);
+      const leftAtMinTop = topRowTbls.find((t) => t.leftIn < maxBudgetWidthInCompile * 0.42);
+      const firstAnchor = leftAtMinTop ?? topRowTbls[0];
       if (firstAnchor) {
         firstAnchor.pageBreakBefore = true;
       } else {
-        // Page had no left/full Tablix (e.g., right-track only or graphic-free page): synthesize a minimal left/full anchor
+        // Page had no compiled Tablix at all (graphic-free page): synthesize a minimal full-width anchor
         const rightOnly = pageTbls[0];
         const anchorTop = rightOnly
           ? rightOnly.topIn
@@ -672,6 +818,20 @@ export class Flat2008TablixCompiler {
       }
     }
 
+    const summaryByName = new Map(sectionSummaries.map((s) => [s.name, s]));
+    let nestedTablixCount = 0;
+    for (const t of bodyTablixes) {
+      const ss = summaryByName.get(t.name);
+      if (ss) ss.pageBreakStart = Boolean(t.pageBreakBefore);
+      for (const row of t.rows) {
+        for (const cell of row.cells) {
+          if (!cell.skipBecauseMerged && cell.content.kind === 'Tablix') {
+            nestedTablixCount++;
+          }
+        }
+      }
+    }
+
     const hierarchy: RdlcDocumentHierarchy = {
       mode: 'v3-full-tablix-single-rdlc',
       pageHeader: pageHeaderSpec
@@ -697,7 +857,7 @@ export class Flat2008TablixCompiler {
 
     this.logger.info('Flat2008Compiler', 'Strict RDLC 2008 flat Master-Grid compilation complete', {
       tablixes: bodyTablixes.length,
-      nestedTablixes: 0,
+      nestedTablixes: nestedTablixCount,
       hasPageHeader: Boolean(pageHeaderSpec),
       hasPageFooter: Boolean(pageFooterSpec),
     });
@@ -733,10 +893,19 @@ export class Flat2008TablixCompiler {
     const allHeaderRegions = pages.flatMap((p) => p.regions.filter((r) => r.bandKind === 'Header'));
     const allFooterRegions = pages.flatMap((p) => p.regions.filter((r) => r.bandKind === 'Footer'));
 
+    const distinctHeaderPages = new Set(allHeaderRegions.map((r) => r.pageNumber));
+    const hasHeaderImage = allHeaderRegions.some(
+      (r) => r.imageAssetName === 'HeaderLogo' || r.type === 'image'
+    );
+    const hasNativeP1Header = headerRegionsP1.length > 0;
+    const treatAsRepeatingHeader =
+      allHeaderRegions.length > 0 &&
+      (hasNativeP1Header || hasHeaderImage || distinctHeaderPages.size >= 2);
+
     for (const p of pages) {
       const ex = excludedIdsByPage.get(p.pageNumber)!;
       for (const r of p.regions) {
-        if (r.bandKind === 'Header' || r.bandKind === 'Footer') {
+        if ((treatAsRepeatingHeader && r.bandKind === 'Header') || r.bandKind === 'Footer') {
           ex.add(r.id);
         }
       }
@@ -746,8 +915,7 @@ export class Flat2008TablixCompiler {
     let pageHeaderSpec: RdlcBandContainerSpec | undefined;
     let bodyTopOriginIn = marginsIn.top;
 
-    if (allHeaderRegions.length > 0) {
-      const hasNativeP1Header = headerRegionsP1.length > 0;
+    if (treatAsRepeatingHeader) {
       const headerSourceRegions = hasNativeP1Header
         ? [...headerRegionsP1]
         : allHeaderRegions.filter((r) => r.pageNumber === allHeaderRegions[0].pageNumber);
@@ -1092,8 +1260,33 @@ export class Flat2008TablixCompiler {
       }
     }
 
+    // Drop composite outer RLE/vector bounding rects that enclose >= 2 distinct smaller sub-banners
+    const atomicBannerRects = bannerRects.filter((outer) => {
+      const innerCount = bannerRects.filter(
+        (inner) =>
+          inner !== outer &&
+          inner.x >= outer.x - ptToIn(4) &&
+          inner.x + inner.width <= outer.x + outer.width + ptToIn(4) &&
+          inner.y >= outer.y - ptToIn(4) &&
+          inner.y + inner.height <= outer.y + outer.height + ptToIn(4) &&
+          (inner.height <= outer.height * 0.72 || inner.width <= outer.width * 0.65)
+      ).length;
+      if (innerCount >= 2) {
+        consumedRegionIds.add(outer.region.id);
+        return false;
+      }
+      return true;
+    });
+
+    const pageVLines = [
+      ...items.filter((it) => it.kind === 'line' && it.width <= ptToIn(3.5) && it.height >= ptToIn(14)),
+      ...pagePrimitives
+        .filter((pr) => pr.kind === 'VLine')
+        .map((pr) => ({ x: pr.x, y: pr.y, width: pr.width, height: pr.height })),
+    ];
+
     const banners: BannerElement[] = [];
-    for (const br of bannerRects) {
+    for (const br of atomicBannerRects) {
       const bgHex = br.region.style.backgroundColor;
       const bgRgb = parseHexRgb(bgHex);
       if (!bgRgb) continue;
@@ -1108,6 +1301,20 @@ export class Flat2008TablixCompiler {
       if (overlapsExistingBanner) {
         consumedRegionIds.add(br.region.id);
         continue;
+      }
+
+      // Skip narrow table-header cell fills that sit inside a multi-column ruled table (>= 4 VLines or >= 3 peer rects on same row)
+      if (br.width < printableWidthIn * 0.45) {
+        const peerRectsCount = atomicBannerRects.filter(
+          (other) => Math.abs(other.y - br.y) <= ptToIn(5) && other.width < printableWidthIn * 0.45
+        ).length;
+        const vLinesBelowCount = clusterValues(
+          pageVLines
+            .filter((vl) => vl.y <= br.y + br.height + ptToIn(90) && vl.y + vl.height >= br.y - ptToIn(4))
+            .map((vl) => vl.x),
+          ptToIn(4)
+        ).length;
+        if (peerRectsCount >= 3 || vLinesBelowCount >= 4) continue;
       }
 
       const enclosed = items
@@ -1145,12 +1352,13 @@ export class Flat2008TablixCompiler {
           return tRgb ? relativeLuminance(tRgb) > 0.55 && contrastRatio(t.region.style.color, bgHex) >= 2.6 : false;
         });
 
-      // Avoid misclassifying multi-column data table header bars (3+ separate columns inside a light shaded bar)
+      // Avoid misclassifying multi-column data table header bars (3+ separate columns inside a shaded bar)
       let distinctHorizontalCols = 1;
       for (let k = 1; k < enclosed.length; k++) {
         const gap = enclosed[k].x - (enclosed[k - 1].x + enclosed[k - 1].width);
         if (gap > ptToIn(10)) distinctHorizontalCols++;
       }
+      if (distinctHorizontalCols >= 3) continue;
       const isSingleHeadingBar = distinctHorizontalCols <= 2 && bgLum < 0.78 && maxTextContrast >= 2.8;
 
       if (!hasLightTextOnDarkFill && !isSingleHeadingBar) continue;
@@ -1200,17 +1408,147 @@ export class Flat2008TablixCompiler {
     let activeFull: LogicalSegmentBlock | null = null;
     let activeLeft: LogicalSegmentBlock | null = null;
     let activeRight: LogicalSegmentBlock | null = null;
+    let pendingParentBanner: { banner: BannerElement; pageNumber: number; semanticName: string } | null = null;
     let sectionSeq = 1;
+
+    const tryDetectParentNestedGutter = (items: PositionedItem[]): number | undefined => {
+      if (items.length < 4) return undefined;
+      const minGutterIn = ptToIn(Math.max(6, weights.minCenterGutterPt));
+      const nonLineItems = items.filter((it) => it.kind === 'text' || it.kind === 'image' || it.kind === 'rect');
+      if (nonLineItems.length < 4) return undefined;
+
+      const xIntervals = nonLineItems
+        .filter((it) => it.width < maxBudgetWidthIn * 0.65)
+        .map((it) => ({ x1: it.x, x2: it.x + it.width }))
+        .sort((a, b) => a.x1 - b.x1);
+      if (xIntervals.length < 4) return undefined;
+
+      const mergedX: Array<{ x1: number; x2: number }> = [{ ...xIntervals[0] }];
+      for (let i = 1; i < xIntervals.length; i++) {
+        const cur = xIntervals[i];
+        const prev = mergedX[mergedX.length - 1];
+        if (cur.x1 <= prev.x2 + ptToIn(3)) {
+          prev.x2 = Math.max(prev.x2, cur.x2);
+        } else {
+          mergedX.push({ ...cur });
+        }
+      }
+
+      let bestCenter: number | undefined;
+      let bestGap = 0;
+      for (let i = 0; i < mergedX.length - 1; i++) {
+        const gap = mergedX[i + 1].x1 - mergedX[i].x2;
+        const center = (mergedX[i].x2 + mergedX[i + 1].x1) / 2;
+        if (gap < minGutterIn || center < maxBudgetWidthIn * 0.25 || center > maxBudgetWidthIn * 0.75) {
+          continue;
+        }
+        const crossing = items.some(
+          (it) =>
+            it.kind !== 'line' &&
+            it.x < center - ptToIn(2) &&
+            it.x + it.width > center + ptToIn(2)
+        );
+        if (crossing) continue;
+
+        const leftSide = items.filter((it) => it.x + it.width / 2 < center);
+        const rightSide = items.filter((it) => it.x + it.width / 2 >= center);
+        const leftTexts = leftSide.filter((it) => it.kind === 'text');
+        const rightTexts = rightSide.filter((it) => it.kind === 'text');
+        if (leftTexts.length < 2 || rightTexts.length < 2) continue;
+
+        // Require genuinely overlapping vertical ranges so Left & Right are side-by-side
+        const lMinY = Math.min(...leftSide.map((it) => it.y));
+        const lMaxY = Math.max(...leftSide.map((it) => it.y + it.height));
+        const rMinY = Math.min(...rightSide.map((it) => it.y));
+        const rMaxY = Math.max(...rightSide.map((it) => it.y + it.height));
+        if (Math.min(lMaxY, rMaxY) <= Math.max(lMinY, rMinY) - ptToIn(10)) continue;
+
+        const leftV = leftSide.filter((it) => it.kind === 'line' && it.width <= ptToIn(3.5) && it.height >= ptToIn(12)).length;
+        const rightV = rightSide.filter((it) => it.kind === 'line' && it.width <= ptToIn(3.5) && it.height >= ptToIn(12)).length;
+        const leftR = leftSide.filter((it) => it.kind === 'rect' && it.height >= ptToIn(10)).length;
+        const rightR = rightSide.filter((it) => it.kind === 'rect' && it.height >= ptToIn(10)).length;
+        const hasPairedStructure =
+          (leftV >= 2 && rightV >= 2) ||
+          (leftR >= 2 && rightR >= 2) ||
+          (leftTexts.length >= 3 && rightTexts.length >= 3);
+        if (hasPairedStructure && gap > bestGap) {
+          bestGap = gap;
+          bestCenter = roundIn(center);
+        }
+      }
+      return bestCenter;
+    };
 
     const flushFull = () => {
       if (activeFull && (activeFull.items.length > 0 || activeFull.banner)) {
+        if (!activeFull.isFootnote && activeFull.banner) {
+          const bRgb = parseHexRgb(activeFull.banner.rect.region.style.backgroundColor);
+          const bLum = bRgb ? relativeLuminance(bRgb) : 1;
+          const isDarkFullBanner =
+            bLum < 0.72 && activeFull.banner.width >= maxBudgetWidthIn * 0.85;
+          if (isDarkFullBanner) {
+            const nestedGutter = tryDetectParentNestedGutter(activeFull.items);
+            if (nestedGutter !== undefined) {
+              const bounds = computeTrackBounds(nestedGutter);
+              const splitItems = activeFull.items.filter(
+                (it) =>
+                  !(
+                    it.kind === 'line' &&
+                    it.height <= ptToIn(3.5) &&
+                    it.x < nestedGutter - ptToIn(10) &&
+                    it.x + it.width > nestedGutter + ptToIn(10)
+                  )
+              );
+              const leftItems = splitItems.filter((it) => it.x + it.width / 2 < nestedGutter);
+              const rightItems = splitItems.filter((it) => it.x + it.width / 2 >= nestedGutter);
+              activeFull.nestedDual = {
+                gutterXIn: nestedGutter,
+                leftBlock: {
+                  semanticName: makeTrackName('Left', activeFull.banner.titleText),
+                  track: 'left',
+                  leftIn: 0,
+                  widthIn: bounds.leftWidth,
+                  pageNumber: activeFull.pageNumber,
+                  pageBreakBefore: false,
+                  items: leftItems,
+                },
+                rightBlock: {
+                  semanticName: makeTrackName('Right', activeFull.banner.titleText),
+                  track: 'right',
+                  leftIn: bounds.rightLeft,
+                  widthIn: bounds.rightWidth,
+                  pageNumber: activeFull.pageNumber,
+                  pageBreakBefore: false,
+                  items: rightItems,
+                },
+              };
+            }
+          }
+        }
         blocks.push(activeFull);
       }
       activeFull = null;
     };
 
+    const flushPendingParentBannerOnly = () => {
+      if (!pendingParentBanner) return;
+      blocks.push({
+        semanticName: pendingParentBanner.semanticName,
+        track: 'full',
+        leftIn: 0,
+        widthIn: maxBudgetWidthIn,
+        pageNumber: pendingParentBanner.pageNumber,
+        pageBreakBefore: false,
+        isBannerOnly: true,
+        banner: pendingParentBanner.banner,
+        items: [],
+      });
+      pendingParentBanner = null;
+    };
+
     const flushLeft = () => {
       if (activeLeft && (activeLeft.items.length > 0 || activeLeft.banner)) {
+        flushPendingParentBannerOnly();
         blocks.push(activeLeft);
       }
       activeLeft = null;
@@ -1218,12 +1556,44 @@ export class Flat2008TablixCompiler {
 
     const flushRight = () => {
       if (activeRight && (activeRight.items.length > 0 || activeRight.banner)) {
+        flushPendingParentBannerOnly();
         blocks.push({ ...activeRight, pageBreakBefore: false });
       }
       activeRight = null;
     };
 
     const flushAllSideBySide = () => {
+      if (
+        pendingParentBanner &&
+        activeLeft &&
+        activeRight &&
+        (activeLeft.items.length > 0 || activeLeft.banner) &&
+        (activeRight.items.length > 0 || activeRight.banner) &&
+        activeLeft.pageNumber === pendingParentBanner.pageNumber &&
+        activeRight.pageNumber === pendingParentBanner.pageNumber
+      ) {
+        blocks.push({
+          semanticName: pendingParentBanner.semanticName,
+          track: 'full',
+          leftIn: 0,
+          widthIn: maxBudgetWidthIn,
+          pageNumber: pendingParentBanner.pageNumber,
+          pageBreakBefore: false,
+          banner: pendingParentBanner.banner,
+          items: [],
+          nestedDual: {
+            gutterXIn,
+            leftBlock: { ...activeLeft, pageBreakBefore: false },
+            rightBlock: { ...activeRight, pageBreakBefore: false },
+          },
+        });
+        pendingParentBanner = null;
+        activeLeft = null;
+        activeRight = null;
+        sideBySide = false;
+        return;
+      }
+      flushPendingParentBannerOnly();
       flushLeft();
       flushRight();
       sideBySide = false;
@@ -1238,11 +1608,12 @@ export class Flat2008TablixCompiler {
     };
 
     const makeTrackName = (side: 'Left' | 'Right', title?: string): string => {
+      const seqStr = String(sectionSeq++).padStart(2, '0');
       if (title) {
         const slug = sanitize2008Identifier(title.split(/\s+/).slice(0, 5).join('_'), side);
-        return `Tablix_${side}_${String(sectionSeq++).padStart(2, '0')}_${slug}`;
+        return `Tablix_${seqStr}_${side}_${slug}`;
       }
-      return `Tablix_${side}_${String(sectionSeq++).padStart(2, '0')}`;
+      return `Tablix_${seqStr}_${side}`;
     };
 
     // Helper: group a flat list of PositionedItems into Y-baseline rows for purely structural lookahead
@@ -1442,15 +1813,24 @@ export class Flat2008TablixCompiler {
       // Segment non-banner items between consecutive banner Y-ranges into Y-rows for structural splitting
       bannerEvents.sort((a, b) => a.y - b.y);
 
-      // Operator B: On a new page, reset persistent sideBySide if page starts with full-width content before any dual-track banner
+      // Operator B: On a new page, reset persistent sideBySide only if a full-width banner or full-width crossing precedes any dual-track content
       if (pageLoopIdx > 0 && sideBySide) {
         const firstNonFullEv = bannerEvents.find(
           (ev) => ev.kind === 'pair' || ev.kind === 'twoTier' || ev.kind === 'singleTrack'
         );
         const firstFullEv = bannerEvents.find((ev) => ev.kind === 'full');
+        const hasContentAboveFirstFull =
+          Boolean(firstFullEv) &&
+          nonBannerItems.some(
+            (it) =>
+              (it.kind === 'text' || it.kind === 'image') &&
+              it.y + it.height / 2 < firstFullEv!.y - ptToIn(4)
+          );
         const fullBannerFirst =
-          Boolean(firstFullEv) && (!firstNonFullEv || firstFullEv!.y < firstNonFullEv.y);
-        const leadingCutoffY = firstNonFullEv ? firstNonFullEv.y : Infinity;
+          Boolean(firstFullEv) &&
+          !hasContentAboveFirstFull &&
+          (!firstNonFullEv || firstFullEv!.y < firstNonFullEv.y);
+        const leadingCutoffY = firstNonFullEv ? firstNonFullEv.y : firstFullEv ? firstFullEv.y : Infinity;
         const hasLeadingFullCrossing = nonBannerItems.some(
           (it) =>
             it.y + it.height / 2 < leadingCutoffY &&
@@ -1881,6 +2261,25 @@ export class Flat2008TablixCompiler {
       const processNonBannerSegment = (segmentItems: PositionedItem[]) => {
         if (segmentItems.length === 0) return;
 
+        // [R-PARENT-NESTED]: When activeFull holds a dark full-width FillBanner directly above a dual-sided segment,
+        // keep all segment items attached to activeFull so flushFull() nests Left & Right inside the 2-col outer Tablix.
+        const activeBannerIsDarkFull = (() => {
+          if (!activeFull || activeFull.track !== 'full' || !activeFull.banner) return false;
+          const bRgb = parseHexRgb(activeFull.banner.rect.region.style.backgroundColor);
+          const bLum = bRgb ? relativeLuminance(bRgb) : 1;
+          return bLum < 0.72 && activeFull.banner.width >= maxBudgetWidthIn * 0.85;
+        })();
+        const keepUnifiedForParentNested =
+          !sideBySide &&
+          activeBannerIsDarkFull &&
+          activeFull!.items.length === 0 &&
+          tryDetectParentNestedGutter(segmentItems) !== undefined;
+
+        if (keepUnifiedForParentNested) {
+          processBandRows(segmentItems, false);
+          return;
+        }
+
         // Operator A: Split localized twin side-by-side grid Y-bands into Tablix_Left + Tablix_Right
         if (!sideBySide) {
           const twinBand = detectTwinSubTableBand(segmentItems);
@@ -1969,35 +2368,50 @@ export class Flat2008TablixCompiler {
               it.height <= ptToIn(3.5) &&
               it.width >= maxBudgetWidthIn * weights.hDividerMinWidthRatio
           );
+          const segVLines = segmentItems.filter(
+            (it) => it.kind === 'line' && it.width <= ptToIn(3.5) && it.height >= ptToIn(14)
+          );
           const allSplitYs = [
             ...dividerLines.map((d) => d.y),
             ...forcedPageSplits,
           ];
           if (allSplitYs.length > 0) {
             const dividerYs = clusterValues(allSplitYs, ptToIn(4));
-            const subBands: PositionedItem[][] = [];
+            const subBands: Array<{ yCut: number; items: PositionedItem[] }> = [];
             let prevCut = -Infinity;
             for (const dy of dividerYs) {
               const band = segmentItems.filter(
                 (it) => it.y >= prevCut && it.y < dy - ptToIn(1) && !dividerLines.includes(it)
               );
-              if (band.length > 0) subBands.push(band);
+              if (band.some((it) => it.kind === 'text' || it.kind === 'image')) {
+                subBands.push({ yCut: prevCut, items: band });
+              }
               prevCut = dy - ptToIn(1);
             }
             const tailBand = segmentItems.filter(
               (it) => it.y >= prevCut && !dividerLines.includes(it)
             );
-            if (tailBand.length > 0) subBands.push(tailBand);
+            if (tailBand.some((it) => it.kind === 'text' || it.kind === 'image')) {
+              subBands.push({ yCut: prevCut, items: tailBand });
+            }
 
             if (subBands.length >= 2) {
               let prevTopo: 'multiGrid' | 'narrative' | null = activeFull?.items.length
                 ? classifyBandTopology(activeFull.items)
                 : null;
               for (let sbIdx = 0; sbIdx < subBands.length; sbIdx++) {
-                const subBand = subBands[sbIdx];
+                const subBand = subBands[sbIdx].items;
+                const cutY = subBands[sbIdx].yCut;
                 const curTopo = classifyBandTopology(subBand);
                 const isForcedCut = forcedPageSplits.length > 0;
-                if (sbIdx > 0 && (isForcedCut || (prevTopo && (curTopo !== prevTopo || prevTopo === 'multiGrid')))) {
+                const hasSpanningVLineAtCut =
+                  cutY > -Infinity &&
+                  segVLines.some((vl) => vl.y <= cutY + ptToIn(4) && vl.y + vl.height >= cutY - ptToIn(4));
+                if (
+                  sbIdx > 0 &&
+                  !hasSpanningVLineAtCut &&
+                  (isForcedCut || (prevTopo && curTopo !== prevTopo))
+                ) {
                   flushFull();
                 }
                 processBandRows(subBand, dividerLines.length > 0 && !isForcedCut);
@@ -2036,9 +2450,10 @@ export class Flat2008TablixCompiler {
             cy <= evBot + ptToIn(1.5) &&
             cx >= evXMin - ptToIn(3) &&
             cx <= evXMax + ptToIn(3) &&
-            it.kind === 'text'
+            (it.kind === 'text' ||
+              (it.kind === 'rect' && it.y >= ev.y - ptToIn(3) && it.y + it.height <= evBot + ptToIn(3)))
           ) {
-            // Drop residual/duplicate text centered strictly inside the banner fill box
+            // Drop residual/duplicate text and inner/composite banner fill rects enclosed inside the banner band
             continue;
           } else {
             afterItems.push(it);
@@ -2063,17 +2478,27 @@ export class Flat2008TablixCompiler {
         } else if (ev.kind === 'twoTier') {
           flushAllSideBySide();
           flushFull();
-          blocks.push({
-            semanticName: makeFullName(ev.topBanner.titleText, pNum),
-            track: 'full',
-            leftIn: 0,
-            widthIn: maxBudgetWidthIn,
-            pageNumber: pNum,
-            pageBreakBefore: false,
-            isBannerOnly: true,
-            banner: ev.topBanner,
-            items: [],
-          });
+          const topRgb = parseHexRgb(ev.topBanner.rect.region.style.backgroundColor);
+          const topLum = topRgb ? relativeLuminance(topRgb) : 1;
+          if (topLum < 0.72 && ev.topBanner.width >= maxBudgetWidthIn * 0.85) {
+            pendingParentBanner = {
+              semanticName: makeFullName(ev.topBanner.titleText, pNum),
+              banner: ev.topBanner,
+              pageNumber: pNum,
+            };
+          } else {
+            blocks.push({
+              semanticName: makeFullName(ev.topBanner.titleText, pNum),
+              track: 'full',
+              leftIn: 0,
+              widthIn: maxBudgetWidthIn,
+              pageNumber: pNum,
+              pageBreakBefore: false,
+              isBannerOnly: true,
+              banner: ev.topBanner,
+              items: [],
+            });
+          }
           sideBySide = true;
           gutterXIn = roundIn((ev.left.x + ev.left.width + ev.right.x) / 2);
           const bounds = computeTrackBounds(gutterXIn);
@@ -2198,14 +2623,24 @@ export class Flat2008TablixCompiler {
     for (const pNum of sortedPageNums) {
       const pBlocks = pageGroups.get(pNum)!;
       if (seenPages.size > 0) {
-        const firstAnchorIdx = pBlocks.findIndex((b) => b.track === 'full' || b.track === 'left');
-        if (firstAnchorIdx > 0 && pBlocks[0].track === 'right') {
-          const [anchor] = pBlocks.splice(firstAnchorIdx, 1);
-          pBlocks.unshift(anchor);
+        if (pBlocks.length > 0 && pBlocks[0].track === 'right') {
+          const pairedLeftIdx = pBlocks.findIndex(
+            (b) => b.track === 'left' && b.pairedStart === pBlocks[0].pairedStart
+          );
+          if (pairedLeftIdx > 0) {
+            const [anchor] = pBlocks.splice(pairedLeftIdx, 1);
+            pBlocks.unshift(anchor);
+          }
         }
-        const breakTarget = pBlocks.find((b) => b.track === 'full' || b.track === 'left');
+        const breakTarget =
+          pBlocks.find((b) => b.track === 'full' || b.track === 'left') ?? pBlocks[0];
         if (breakTarget) {
-          breakTarget.pageBreakBefore = true;
+          if (pBlocks[0]?.track === 'right' && breakTarget !== pBlocks[0]) {
+            // Right-track leads page above a later full/left section: PageBreak must anchor on the top-most block
+            pBlocks[0].pageBreakBefore = true;
+          } else {
+            breakTarget.pageBreakBefore = true;
+          }
         }
       }
       seenPages.add(pNum);
@@ -2358,6 +2793,7 @@ export class Flat2008TablixCompiler {
       .map((pr) => ({
         yTop: pr.y + yPageShift,
         yBottom: pr.y + pr.height + yPageShift,
+        width: pr.width,
       }));
 
     const outerFrameRects = rectItems.filter((rc) => {
@@ -2458,7 +2894,7 @@ export class Flat2008TablixCompiler {
             : 'INDENTATION_CLAUSE_SOLVER';
       }
       const preparedItems =
-        selectedStrategy === 'HLINE_OPERATOR_EQUATION_SOLVER'
+        selectedStrategy === 'HLINE_OPERATOR_EQUATION_SOLVER' || signature.operatorColumnCount >= 1
           ? this.splitOperatorAlignedTokens(contentItems, weights)
           : contentItems;
       const expandedContentItems = this.expandMultilineItems(preparedItems);
@@ -2472,7 +2908,8 @@ export class Flat2008TablixCompiler {
         block.pageNumber,
         bodyTopOriginIn,
         weights,
-        constraints
+        constraints,
+        rowFillBandsRel
       );
       logicalRows =
         selectedStrategy === 'KEY_VALUE_SUBGRID_FLATTENER' || signature.hasEmbeddedSubGrid
@@ -2731,11 +3168,20 @@ export class Flat2008TablixCompiler {
           coveredWidthPt: number;
         }> = [];
 
+        const rowTextFontSizes = cleanSlots.flatMap((sl) =>
+          sl.items.filter((i) => i.kind === 'text').map((i) => i.region.style.fontSizePt || 8.5)
+        );
+        const emptyFontPt =
+          rowTextFontSizes.length > 0
+            ? Math.min(8.5, Math.max(5.5, Math.min(...rowTextFontSizes)))
+            : 7.5;
+        const emptyFillerTextStyle = defaultTextStyle(emptyFontPt, pageWeights);
+
         let col = 0;
         for (const sl of cleanSlots) {
           while (col < sl.startCol) {
             const colW = columnWidthsIn[col];
-            const emptyStyle = this.buildTableCellStyle(undefined, undefined, rowAppliesTableGrid, false, pageWeights);
+            const emptyStyle = this.buildTableCellStyle(emptyFillerTextStyle, undefined, rowAppliesTableGrid, false, pageWeights);
             cells.push({
               colIndex: col,
               rowIndex: outRowIndex,
@@ -2938,7 +3384,7 @@ export class Flat2008TablixCompiler {
 
         while (col < numCols) {
           const colW = columnWidthsIn[col];
-          const emptyStyle = this.buildTableCellStyle(undefined, undefined, rowAppliesTableGrid, false, pageWeights);
+          const emptyStyle = this.buildTableCellStyle(emptyFillerTextStyle, undefined, rowAppliesTableGrid, false, pageWeights);
           cells.push({
             colIndex: col,
             rowIndex: outRowIndex,
@@ -2975,17 +3421,39 @@ export class Flat2008TablixCompiler {
       }
     }
 
-    // Step 2 Over-Split Row Recovery: merge consecutive Regular prose rows sharing x0 without dividers
-    if (pageOverride?.mergeOverSplitRows && !isDataTable && selectedStrategy !== 'PLANAR_GRID_SOLVER') {
-      this.mergeOverSplitTablixRows(
-        tablixRows,
-        emittedLogicalRows,
-        columnWidthsIn,
-        Boolean(block.banner),
-        minRowHeightPt,
-        pageWeights
-      );
+    // [R-ROW-BOLD-MERGE] Convergent loop: merge consecutive Regular prose rows sharing column/x0 without dividers
+    if (!isDataTable && selectedStrategy !== 'PLANAR_GRID_SOLVER') {
+      let didMerge = true;
+      let mergeGuard = 0;
+      while (didMerge && mergeGuard < 16) {
+        mergeGuard++;
+        didMerge = this.mergeOverSplitTablixRows(
+          tablixRows,
+          emittedLogicalRows,
+          columnWidthsIn,
+          Boolean(block.banner),
+          minRowHeightPt,
+          pageWeights,
+          lineItems,
+          rowFillBandsRel,
+          tableRects,
+          Boolean(pageOverride?.mergeOverSplitRows)
+        );
+      }
     }
+
+    // [R-B-NONE] / [R-B-GRID] / [R-B-BOX] / [R-B-HLINE]:
+    // Borders are None by default; Solid ONLY on edges matched to extracted vector primitives (<= 2.5pt, >= 70% coverage)
+    this.applyVectorMatchedCellBorders(
+      tablixRows,
+      tableRects,
+      lineItems,
+      outerFrameRects,
+      emittedLogicalRows,
+      atomicColBoundaries,
+      isDataTable,
+      Boolean(block.banner)
+    );
 
     // Layer 3 Rule 5: Vertical Merging WITHOUT <RowSpan> (border suppression for grouped vertical labels)
     this.applyVerticalMergeBorderSuppression(
@@ -2996,31 +3464,6 @@ export class Flat2008TablixCompiler {
       atomicColBoundaries,
       isDataTable
     );
-
-    // Apply perimeter-only border if a full-section outer frame box wrapped a narrative/non-table block
-    if (!isDataTable && outerFrameRects.length > 0 && tablixRows.length > 0) {
-      const frameColor = outerFrameRects[0].region.style.borderColor;
-      const frameWidthPt = outerFrameRects[0].region.style.borderWidthPt ?? 0.5;
-      if (frameColor) {
-        const firstBodyIdx = block.banner ? 1 : 0;
-        const lastBodyIdx = tablixRows.length - 1;
-        const solidEdge: CellBorderEdge = { style: 'Solid', color: frameColor, widthPt: frameWidthPt };
-        const noneEdge: CellBorderEdge = { style: 'None' };
-        for (let rIdx = firstBodyIdx; rIdx <= lastBodyIdx; rIdx++) {
-          const row = tablixRows[rIdx];
-          for (const cell of row.cells) {
-            if (cell.skipBecauseMerged || cell.content.kind !== 'Textbox') continue;
-            if (cell.content.style.borderColor) continue;
-            cell.content.style.borderEdges = {
-              top: rIdx === firstBodyIdx ? solidEdge : noneEdge,
-              bottom: rIdx === lastBodyIdx ? solidEdge : noneEdge,
-              left: cell.colIndex === 0 ? solidEdge : noneEdge,
-              right: cell.colIndex + cell.colSpan >= numCols ? solidEdge : noneEdge,
-            };
-          }
-        }
-      }
-    }
 
     const totalHeightIn = roundIn(
       Math.max(ptToIn(14), tablixRows.reduce((s, r) => s + r.heightIn, 0))
@@ -3072,14 +3515,7 @@ export class Flat2008TablixCompiler {
         .filter((x) => x > ptToIn(6) && x < blockW - ptToIn(6)),
       ptToIn(2.5)
     );
-    const internalVLineCount = Math.max(vLines.length, rectInteriorXs.length);
-
-    const shadedRectYs = clusterValues(
-      tableRects.filter((rc) => isNonWhiteFill(rc.region.style.backgroundColor)).map((rc) => rc.y),
-      ptToIn(weights.yRowClusterTolPt)
-    );
-    const shadedRowBandCount = Math.max(rowFillBands.length, shadedRectYs.length);
-
+    const shadedRowBandCount = rowFillBands.length;
     // Check localized embedded sub-grid (cluster of tableRects/vLines spanning < 65% of container Y)
     let hasEmbeddedSubGrid = false;
     if (tableRects.length >= 2 && contentSpanY > 0) {
@@ -3109,6 +3545,8 @@ export class Flat2008TablixCompiler {
         return xs.length >= 3 && ys.length >= 2 && outsideCount >= 2;
       });
     }
+
+    const internalVLineCount = hasEmbeddedSubGrid ? vLines.length : Math.max(vLines.length, rectInteriorXs.length);
 
     // Count distinct recurring left-edge x0 indentation tracks
     const textItems = contentItems.filter((it) => it.kind === 'text');
@@ -3198,10 +3636,15 @@ export class Flat2008TablixCompiler {
 
   private splitOperatorAlignedTokens(
     contentItems: PositionedItem[],
-    weights: CompilerWeights
+    _weights: CompilerWeights
   ): PositionedItem[] {
     const out: PositionedItem[] = [];
     const candidateOpXs: number[] = [];
+    const inlineColonRe = /^(.{2,42}?)\s*([:=])\s+(.+)$/;
+    const prefixColonRe = /^([:=])\s+(.+)$/;
+
+    const isTimeColon = (lhs: string, op: string, rhs: string): boolean =>
+      op === ':' && /\d$/.test(lhs.trim()) && /^\d/.test(rhs.trim());
 
     for (const it of contentItems) {
       if (it.kind !== 'text') continue;
@@ -3209,19 +3652,28 @@ export class Flat2008TablixCompiler {
       if (txt === ':' || txt === '=') {
         candidateOpXs.push(it.x);
       } else {
-        const m = txt.match(/^(.{2,36}?)\s*([:=])\s+(.+)$/);
-        if (m) {
+        const pm = txt.match(prefixColonRe);
+        if (pm) {
+          candidateOpXs.push(it.x);
+          continue;
+        }
+        const m = txt.match(inlineColonRe);
+        if (m && !isTimeColon(m[1], m[2], m[3])) {
           const ratio = (m[1].length + 0.5) / Math.max(1, txt.length);
           candidateOpXs.push(it.x + it.width * ratio);
         }
       }
     }
 
-    const opClusters = clusterValues(candidateOpXs, ptToIn(weights.xClusterTolPt * 1.6));
+    // [R-COLON-GRID]: Cluster ':' / '=' X positions (|Δx0| <= 2.5pt)
+    const opClusterTolIn = ptToIn(2.5);
+    const opClusters = clusterValues(candidateOpXs, opClusterTolIn);
     const alignedOpXs = opClusters.filter(
-      (cx) => candidateOpXs.filter((x) => Math.abs(x - cx) <= ptToIn(weights.xClusterTolPt * 1.6)).length >= 2
+      (cx) => candidateOpXs.filter((x) => Math.abs(x - cx) <= opClusterTolIn).length >= 2
     );
     if (alignedOpXs.length === 0) return contentItems;
+
+    const opW = ptToIn(9);
 
     for (const it of contentItems) {
       if (it.kind !== 'text') {
@@ -3229,8 +3681,46 @@ export class Flat2008TablixCompiler {
         continue;
       }
       const txt = (it.region.text ?? '').trim();
-      const m = txt.match(/^(.{2,36}?)\s*([:=])\s+(.+)$/);
-      if (!m) {
+
+      const pm = txt.match(prefixColonRe);
+      if (pm) {
+        const [, op, rhs] = pm;
+        const matchedOpX = alignedOpXs.find((ax) => Math.abs(ax - it.x) <= opClusterTolIn * 1.6);
+        if (matchedOpX !== undefined) {
+          const rhsX = Math.max(it.x + opW + ptToIn(2), matchedOpX + opW + ptToIn(2.5));
+          const rhsW = Math.max(ptToIn(12), it.x + it.width - rhsX);
+          out.push({
+            ...it,
+            x: matchedOpX,
+            width: opW,
+            region: {
+              ...it.region,
+              id: `${it.region.id}-op`,
+              x: it.region.x + (matchedOpX - it.x),
+              width: opW,
+              text: op,
+              runs: undefined,
+            },
+          });
+          out.push({
+            ...it,
+            x: rhsX,
+            width: rhsW,
+            region: {
+              ...it.region,
+              id: `${it.region.id}-rhs`,
+              x: it.region.x + (rhsX - it.x),
+              width: rhsW,
+              text: rhs.trim(),
+              runs: undefined,
+            },
+          });
+          continue;
+        }
+      }
+
+      const m = txt.match(inlineColonRe);
+      if (!m || isTimeColon(m[1], m[2], m[3])) {
         out.push(it);
         continue;
       }
@@ -3238,15 +3728,14 @@ export class Flat2008TablixCompiler {
       const totalLen = Math.max(1, txt.length);
       const ratio = (lhs.length + 0.5) / totalLen;
       const estOpX = it.x + it.width * ratio;
-      const matchedOpX = alignedOpXs.find((ax) => Math.abs(ax - estOpX) <= ptToIn(weights.xClusterTolPt * 2));
-      if (matchedOpX === undefined) {
+      const matchedOpX = alignedOpXs.find((ax) => Math.abs(ax - estOpX) <= ptToIn(4.5));
+      if (matchedOpX === undefined || matchedOpX <= it.x + ptToIn(8)) {
         out.push(it);
         continue;
       }
 
-      const opW = ptToIn(Math.max(6, (it.region.style.fontSizePt || 8.5) * 0.7));
       const lhsW = Math.max(ptToIn(12), matchedOpX - it.x - ptToIn(2));
-      const rhsX = matchedOpX + opW + ptToIn(3);
+      const rhsX = matchedOpX + opW + ptToIn(2.5);
       const rhsW = Math.max(ptToIn(14), it.x + it.width - rhsX);
 
       out.push({
@@ -3383,12 +3872,45 @@ export class Flat2008TablixCompiler {
       });
     }
 
+    const topDividerLine =
+      textItems.length > 0
+        ? relItems
+            .filter(
+              (ln) =>
+                ln.kind === 'line' &&
+                ln.height <= ptToIn(3.5) &&
+                ln.width >= blockW * 0.5 &&
+                ln.y <= textItems[0].y + ptToIn(2) &&
+                ln.y >= textItems[0].y - ptToIn(8)
+            )
+            .sort((a, b) => Math.abs(a.y - textItems[0].y) - Math.abs(b.y - textItems[0].y))[0]
+        : undefined;
+
     const minRowH = pageOverride?.minRowHeightPt ?? 12.5;
     const rows: TablixRow[] = [];
-    for (const fnRow of mergedFootnoteRows) {
+    for (let fnIdx = 0; fnIdx < mergedFootnoteRows.length; fnIdx++) {
+      const fnRow = mergedFootnoteRows[fnIdx];
       const markerText = fnRow.marker;
       const bodyText = fnRow.text;
-      const baseStyle = fnRow.style;
+      const rowTopEdge: CellBorderEdge | undefined =
+        fnIdx === 0 && topDividerLine
+          ? {
+              style: 'Solid',
+              color: topDividerLine.region.style.borderColor ?? topDividerLine.region.style.backgroundColor ?? '#94A3B8',
+              widthPt: topDividerLine.region.style.borderWidthPt ?? 0.5,
+            }
+          : undefined;
+      const baseStyle: RegionStyle = rowTopEdge
+        ? {
+            ...fnRow.style,
+            borderEdges: {
+              top: rowTopEdge,
+              bottom: { style: 'None' },
+              left: { style: 'None' },
+              right: { style: 'None' },
+            },
+          }
+        : fnRow.style;
       const outIdx = rows.length;
       if (fnRow.isTitle) {
         const hPt = estimateWrappedRowHeightPt(
@@ -3454,7 +3976,7 @@ export class Flat2008TablixCompiler {
                 name: nextUniqueName('NoteMark'),
                 value: markerText,
                 isExpression: false,
-                style: baseStyle,
+                style: { ...baseStyle },
                 canGrow: true,
               },
             },
@@ -3469,7 +3991,7 @@ export class Flat2008TablixCompiler {
                 name: nextUniqueName('NoteText'),
                 value: bodyText,
                 isExpression: false,
-                style: baseStyle,
+                style: { ...baseStyle },
                 canGrow: true,
                 sourceLineCount: fnRow.lineCount,
                 sourceX0In: roundIn(block.leftIn + fnRow.lastX),
@@ -3763,7 +4285,8 @@ export class Flat2008TablixCompiler {
     pageNumber = 1,
     bodyTopOriginIn = 0,
     weights: CompilerWeights = DEFAULT_COMPILER_WEIGHTS,
-    constraints: CalibrationConstraints = { forbidColumnSplits: [], forceTablixSplitsY: [], forceRowSplitsY: [] }
+    constraints: CalibrationConstraints = { forbidColumnSplits: [], forceTablixSplitsY: [], forceRowSplitsY: [] },
+    rowFillBands: Array<{ yTop: number; yBottom: number }> = []
   ): LogicalRowBucket[] {
     if (rows.length <= 1) return rows;
 
@@ -3808,6 +4331,14 @@ export class Flat2008TablixCompiler {
           ln.x + ln.width >= x1 + ptToIn(4)
       );
       if (hasLine) return true;
+
+      // [R-ROW-PHYS]: Physical RowFillBand boundary edges (<= 2pt) cut paragraph merging
+      const hasBandEdge = rowFillBands.some(
+        (rb) =>
+          (rb.yTop >= y1 - ptToIn(2) && rb.yTop <= y2 + ptToIn(2)) ||
+          (rb.yBottom >= y1 - ptToIn(2) && rb.yBottom <= y2 + ptToIn(2))
+      );
+      if (hasBandEdge) return true;
 
       return rectItems.some((rc) => {
         if (sharedRectId && rc.region.id === sharedRectId) return false;
@@ -3859,7 +4390,8 @@ export class Flat2008TablixCompiler {
     };
 
     const mergeOverride = constraints.pageOverrides?.find((o) => o.pageNumber === pageNumber)?.mergeOverSplitRows;
-    const leadRatio = mergeOverride ? weights.paragraphLeadingRatio * 1.25 : weights.paragraphLeadingRatio;
+    const baseLeadRatio = Math.max(1.65, weights.paragraphLeadingRatio);
+    const leadRatio = mergeOverride ? baseLeadRatio * 1.25 : baseLeadRatio;
     const gapRatio = mergeOverride ? 1.25 : 0.95;
 
     const out: LogicalRowBucket[] = [];
@@ -3939,8 +4471,8 @@ export class Flat2008TablixCompiler {
                 (curItem.x + curItem.width / 2)
             ) <= ptToIn(10);
 
-          // Strict left-edge match |Δx0| <= xClusterTolPt
-          const alignedLeft = Math.abs(curItem.x - lastState.targetBaseX) <= ptToIn(weights.xClusterTolPt);
+          // Strict left-edge match |Δx0| <= max(4pt, xClusterTolPt)
+          const alignedLeft = Math.abs(curItem.x - lastState.targetBaseX) <= ptToIn(Math.max(4, weights.xClusterTolPt));
 
           const colRightBound = curRect
             ? curRect.x + curRect.width - ptToIn(2)
@@ -4173,7 +4705,7 @@ export class Flat2008TablixCompiler {
     contentItems: PositionedItem[],
     tableRects: PositionedItem[],
     lineItems: PositionedItem[],
-    rowFillBands: Array<{ yTop: number; yBottom: number }>,
+    rowFillBands: Array<{ yTop: number; yBottom: number; width?: number }>,
     blockW: number,
     contentSpanY: number,
     weights: CompilerWeights = DEFAULT_COMPILER_WEIGHTS
@@ -4181,16 +4713,36 @@ export class Flat2008TablixCompiler {
     if (contentItems.length < 4) return null;
 
     const vLines = lineItems.filter((ln) => ln.width <= ptToIn(3) && ln.height >= ptToIn(12));
-    const hLines = lineItems.filter((ln) => ln.height <= ptToIn(3) && ln.width >= blockW * 0.55);
+    const rawHLines = lineItems.filter((ln) => ln.height <= ptToIn(3) && ln.width >= ptToIn(8));
+    // Merge collinear horizontal border segments sharing Y (<= 2pt) and small horizontal gap (<= 6pt)
+    const sortedHLines = [...rawHLines].sort((a, b) => a.y - b.y || a.x - b.x);
+    const mergedHLines: Array<{ x0: number; x1: number; y: number }> = [];
+    for (const ln of sortedHLines) {
+      const last = mergedHLines.find(
+        (m) => Math.abs(m.y - ln.y) <= ptToIn(2) && ln.x <= m.x1 + ptToIn(6) && ln.x + ln.width >= m.x0 - ptToIn(6)
+      );
+      if (last) {
+        last.x0 = Math.min(last.x0, ln.x);
+        last.x1 = Math.max(last.x1, ln.x + ln.width);
+      } else {
+        mergedHLines.push({ x0: ln.x, x1: ln.x + ln.width, y: ln.y });
+      }
+    }
+    const hLines = mergedHLines.filter((m) => m.x1 - m.x0 >= blockW * 0.55);
 
     // Mode A activates only when explicit vertical dividers (>= 3 VLines or structured bordered table rects) exist
     if (vLines.length < 3 && tableRects.length < 4) return null;
 
+    // When explicit VLines define the table columns (>= 3 VLines), avoid slicing columns on inner unbordered text-highlight rects
+    const gridSourceRects =
+      vLines.length >= 3
+        ? tableRects.filter((rc) => Boolean(rc.region.style.borderColor) || rc.height >= ptToIn(20))
+        : tableRects;
     const rawGridXs: number[] = [
       0,
       blockW,
       ...vLines.map((ln) => clamp(ln.x, 0, blockW)),
-      ...tableRects.flatMap((rc) => [clamp(rc.x, 0, blockW), clamp(rc.x + rc.width, 0, blockW)]),
+      ...gridSourceRects.flatMap((rc) => [clamp(rc.x, 0, blockW), clamp(rc.x + rc.width, 0, blockW)]),
     ];
     // Dedup VLine X edges within <= 2.5pt
     const clusteredXs = clusterValues(rawGridXs, ptToIn(2.5));
@@ -4203,10 +4755,21 @@ export class Flat2008TablixCompiler {
     }
     gridXs.push(blockW);
 
+    const wideHLines = mergedHLines.filter((m) => m.x1 - m.x0 >= blockW * 0.68);
+    // Only use full-width or table-row-height fill bands for Y cuts when wide HLines already rule the table
+    const usableRowFillBands =
+      wideHLines.length >= 2
+        ? rowFillBands.filter((rb) => (rb.width ?? 0) >= blockW * 0.55 || rb.yBottom - rb.yTop >= ptToIn(20))
+        : rowFillBands;
+    const usableRectsForY =
+      wideHLines.length >= 2
+        ? tableRects.filter((rc) => Boolean(rc.region.style.borderColor) || rc.width >= blockW * 0.55 || rc.height >= ptToIn(20))
+        : tableRects;
+
     const rawGridYs: number[] = [
       ...hLines.map((ln) => ln.y),
-      ...rowFillBands.flatMap((rb) => [rb.yTop, rb.yBottom]),
-      ...tableRects.flatMap((rc) => [rc.y, rc.y + rc.height]),
+      ...usableRowFillBands.flatMap((rb) => [rb.yTop, rb.yBottom]),
+      ...usableRectsForY.flatMap((rc) => [rc.y, rc.y + rc.height]),
     ];
     const gridYs = clusterValues(rawGridYs, ptToIn(weights.yRowClusterTolPt));
 
@@ -4220,34 +4783,58 @@ export class Flat2008TablixCompiler {
     if (above.length > 0) {
       intervals.push([Math.min(...above.map((i) => i.y)) - ptToIn(1), gridYs[0]]);
     }
-    const wideHLines = hLines.filter((ln) => ln.width >= blockW * 0.68);
     for (let k = 0; k < gridYs.length - 1; k++) {
       const yA = gridYs[k];
       const yB = gridYs[k + 1];
       if (yB - yA < ptToIn(4)) continue;
-      const topBoundedByWideH = wideHLines.some((ln) => Math.abs(ln.y - yA) <= ptToIn(4));
+      const topBoundedByWideH =
+        wideHLines.some((ln) => Math.abs(ln.y - yA) <= ptToIn(4)) ||
+        (k === 0 && hLines.some((ln) => Math.abs(ln.y - yB) <= ptToIn(4)));
       const botBoundedByWideH = wideHLines.some((ln) => Math.abs(ln.y - yB) <= ptToIn(4));
+      const hasFullHeightColRect = tableRects.some(
+        (rc) => Math.abs(rc.y - yA) <= ptToIn(4) && Math.abs(rc.y + rc.height - yB) <= ptToIn(4)
+      );
+      const inside = expanded.filter((it) => {
+        const cy = it.y + it.height / 2;
+        return cy >= yA - ptToIn(2) && cy <= yB + ptToIn(2);
+      });
+      const subRows = this.clusterItemsIntoRows(inside, tableRects, weights);
+      const col0Boundary = gridXs[1] ?? blockW * 0.25;
+      const col0AnchorCount = subRows.filter((sr) =>
+        sr.items.some((it) => it.x + it.width / 2 <= col0Boundary + ptToIn(2))
+      ).length;
+      // [R-OUTER-LOCK]: Wide/ruled tables lock outer TablixRow on HLine/full-cell-rect dividers when interval holds <= 1 entry row or <= 90pt
       const lockWideTableRowBand =
-        gridXs.length >= 7 &&
-        topBoundedByWideH &&
-        botBoundedByWideH &&
-        yB - yA <= ptToIn(140);
-      // Sub-slice unshaded tall multi-row intervals using text baselines unless locked by full-width HLines in wide tables
+        (vLines.length >= 4 || gridXs.length >= 5) &&
+        ((topBoundedByWideH && botBoundedByWideH) || hasFullHeightColRect) &&
+        (yB - yA <= ptToIn(90) || col0AnchorCount <= 1);
+      // Sub-slice unshaded tall multi-row intervals only along genuine row-entry starts (col-0 anchors or multi-column starts)
       if (!lockWideTableRowBand && yB - yA > ptToIn(18)) {
-        const inside = expanded.filter((it) => {
-          const cy = it.y + it.height / 2;
-          return cy >= yA - ptToIn(2) && cy <= yB + ptToIn(2);
-        });
-        const yClusters = clusterValues(inside.map((i) => i.y), ptToIn(weights.yRowClusterTolPt));
-        const subRows = this.clusterItemsIntoRows(inside, tableRects, weights);
         const multiColSubRows = subRows.filter((sr) => sr.items.length >= 2).length;
-        if (yClusters.length >= 2 && (multiColSubRows >= 2 || yB - yA > ptToIn(120))) {
-          subRows.forEach((sr, idx) => {
-            const top = idx === 0 ? yA : (subRows[idx - 1].yBottom + sr.yTop) / 2;
-            const bot = idx === subRows.length - 1 ? yB : (sr.yBottom + subRows[idx + 1].yTop) / 2;
-            intervals.push([top, bot]);
-          });
-          continue;
+        if (subRows.length >= 2 && (multiColSubRows >= 2 || yB - yA > ptToIn(90))) {
+          const groupedSubRows: Array<{ yTop: number; yBottom: number }> = [];
+          for (const sr of subRows) {
+            const hasCol0Anchor = sr.items.some((it) => it.x + it.width / 2 <= col0Boundary + ptToIn(2));
+            const curShaded = sr.rects.some((rc) => isNonWhiteFill(rc.region.style.backgroundColor));
+            const prevGrp = groupedSubRows[groupedSubRows.length - 1];
+            const prevIdx = groupedSubRows.length - 1;
+            if (prevGrp && !hasCol0Anchor && sr.items.length <= 2) {
+              prevGrp.yBottom = Math.max(prevGrp.yBottom, sr.yBottom);
+              void prevIdx;
+            } else if (prevGrp && curShaded === false && sr.items.length === 1) {
+              prevGrp.yBottom = Math.max(prevGrp.yBottom, sr.yBottom);
+            } else {
+              groupedSubRows.push({ yTop: sr.yTop, yBottom: sr.yBottom });
+            }
+          }
+          if (groupedSubRows.length >= 2) {
+            groupedSubRows.forEach((gr, idx) => {
+              const top = idx === 0 ? yA : (groupedSubRows[idx - 1].yBottom + gr.yTop) / 2;
+              const bot = idx === groupedSubRows.length - 1 ? yB : (gr.yBottom + groupedSubRows[idx + 1].yTop) / 2;
+              intervals.push([top, bot]);
+            });
+            continue;
+          }
         }
       }
       intervals.push([yA, yB]);
@@ -4548,8 +5135,10 @@ export class Flat2008TablixCompiler {
       }
     }
 
-    // Register indented sub-marker column edges (x_marker and x_body when x_body - x_marker >= 8pt)
-    // and start X edges from multi-cell narrative rows (never from sub-table rows whose grid comes from rect/line edges)
+    // [R-STAIRCASE] + [R-COLON-GRID]:
+    // Register indented sub-marker column edges (<= 3.0pt cluster), staircase indent levels, and narrow ':'/'=' operator columns
+    const staircaseLeftXs: number[] = [];
+    const opWIn = ptToIn(9);
     for (let rIdx = 0; rIdx < rows.length; rIdx++) {
       const row = rows[rIdx];
       if (row.items.length === 0 || row.isSubTableRow) continue;
@@ -4576,11 +5165,40 @@ export class Flat2008TablixCompiler {
         }
       }
       if (row.items.length >= 2) {
-        for (const it of row.items) {
+        for (let iIdx = 0; iIdx < row.items.length; iIdx++) {
+          const it = row.items[iIdx];
           const candidateX = clamp(it.x, 0, blockW);
           if (!isForbiddenColX(candidateX, it.y)) {
             rawEdges.push(candidateX);
           }
+          const txt = (it.region.text ?? '').trim();
+          if (txt === ':' || txt === '=') {
+            const opRight = clamp(it.x + opWIn, 0, blockW);
+            const nextIt = row.items[iIdx + 1];
+            const canAddRight = !nextIt || nextIt.x >= opRight - ptToIn(2);
+            if (canAddRight && !isForbiddenColX(opRight, it.y)) {
+              rawEdges.push(opRight);
+            }
+          }
+        }
+      } else if (row.items.length === 1 && row.items[0].kind === 'text') {
+        const it = row.items[0];
+        if (
+          it.x > ptToIn(6) &&
+          it.x < blockW * 0.45 &&
+          it.region.style.textAlign !== 'Center' &&
+          !isForbiddenColX(it.x, it.y)
+        ) {
+          staircaseLeftXs.push(clamp(it.x, 0, blockW));
+        }
+      }
+    }
+
+    if (staircaseLeftXs.length >= 2) {
+      const stairClusters = clusterValues(staircaseLeftXs, ptToIn(3.0));
+      for (const sx of stairClusters) {
+        if (staircaseLeftXs.filter((x) => Math.abs(x - sx) <= ptToIn(3.0)).length >= 2) {
+          rawEdges.push(sx);
         }
       }
     }
@@ -4741,13 +5359,14 @@ export class Flat2008TablixCompiler {
   private buildTableCellStyle(
     textStyle: RegionStyle | undefined,
     rectStyle: RegionStyle | undefined,
-    applyGridBorder: boolean,
+    _applyGridBorder: boolean,
     isHeaderRow: boolean,
     weights: CompilerWeights = DEFAULT_COMPILER_WEIGHTS
   ): RegionStyle {
     const fontSizePt = textStyle?.fontSizePt ?? 8.5;
     const padV = Math.max(0.25, Math.round((weights.cellPadVerticalPt / 2) * 100) / 100);
     const padH = Math.max(1.5, Math.round(weights.cellPadHorizontalPt * 0.75 * 100) / 100);
+    // [R-B-NONE]: Borders default to None; vector-matched borders are applied by applyVectorMatchedCellBorders
     const base: RegionStyle = {
       fontFamily: textStyle?.fontFamily ?? 'Arial',
       fontSizePt,
@@ -4756,8 +5375,8 @@ export class Flat2008TablixCompiler {
       underline: textStyle?.underline,
       color: textStyle?.color ?? '#0F172A',
       backgroundColor: rectStyle?.backgroundColor ?? textStyle?.backgroundColor,
-      borderColor: applyGridBorder ? '#D0D7DE' : rectStyle?.borderColor,
-      borderWidthPt: applyGridBorder ? 0.5 : rectStyle?.borderWidthPt,
+      borderColor: undefined,
+      borderWidthPt: undefined,
       textAlign: textStyle?.textAlign ?? (isHeaderRow ? 'Center' : 'Left'),
       verticalAlign: isHeaderRow ? 'Middle' : 'Top',
       lineHeightPt: Math.round(fontSizePt * weights.lineHeightMultiplier * 100) / 100,
@@ -4772,9 +5391,46 @@ export class Flat2008TablixCompiler {
     columnWidthsIn: number[],
     hasBannerRow: boolean,
     minRowHeightPt: number,
-    weights: CompilerWeights
-  ): void {
+    weights: CompilerWeights,
+    lineItems: PositionedItem[] = [],
+    rowFillBands: Array<{ yTop: number; yBottom: number }> = [],
+    rectItems: PositionedItem[] = [],
+    relaxedLeading = false
+  ): boolean {
     const startIdx = hasBannerRow ? 1 : 0;
+    const horizLines = lineItems.filter((ln) => ln.height <= ptToIn(3.5) && ln.width >= ptToIn(8));
+    let anyMerged = false;
+
+    const hasPhysicalDividerBetween = (y1: number, y2: number, x1: number, x2: number): boolean => {
+      if (
+        horizLines.some(
+          (ln) =>
+            ln.y >= y1 - ptToIn(2) &&
+            ln.y <= y2 + ptToIn(2) &&
+            ln.x <= x2 - ptToIn(4) &&
+            ln.x + ln.width >= x1 + ptToIn(4)
+        )
+      ) {
+        return true;
+      }
+      if (
+        rowFillBands.some(
+          (rb) =>
+            (rb.yTop >= y1 - ptToIn(2) && rb.yTop <= y2 + ptToIn(2)) ||
+            (rb.yBottom >= y1 - ptToIn(2) && rb.yBottom <= y2 + ptToIn(2))
+        )
+      ) {
+        return true;
+      }
+      return rectItems.some((rc) => {
+        const overlapsX = rc.x <= x2 - ptToIn(4) && rc.x + rc.width >= x1 + ptToIn(4);
+        if (!overlapsX) return false;
+        const topCross = rc.y >= y1 - ptToIn(1.5) && rc.y <= y2 + ptToIn(1.5);
+        const botCross = rc.y + rc.height >= y1 - ptToIn(1.5) && rc.y + rc.height <= y2 + ptToIn(1.5);
+        return topCross || botCross;
+      });
+    };
+
     let i = startIdx;
     while (i + 1 < tablixRows.length) {
       const r1 = tablixRows[i];
@@ -4831,7 +5487,9 @@ export class Flat2008TablixCompiler {
         i++;
         continue;
       }
-      if (Math.abs((tb1.style.fontSizePt || 8.5) - (tb2.style.fontSizePt || 8.5)) > 1.0) {
+      const fs1 = Math.max(6.5, tb1.style.fontSizePt || 8.5);
+      const fs2 = Math.max(6.5, tb2.style.fontSizePt || 8.5);
+      if (Math.abs(fs1 - fs2) > 1.0) {
         i++;
         continue;
       }
@@ -4848,6 +5506,24 @@ export class Flat2008TablixCompiler {
         continue;
       }
 
+      const dyGap = lr2.yTop - lr1.yBottom;
+      const dyBaseline = lr2.yTop - lr1.yTop;
+      const maxBaselinePt = fs1 * (relaxedLeading ? 2.1 : 1.65);
+      if (dyGap > ptToIn(fs1 * (relaxedLeading ? 1.25 : 0.95)) || dyBaseline > ptToIn(maxBaselinePt)) {
+        i++;
+        continue;
+      }
+
+      const spanX1 = Math.min(...lr1.items.map((it) => it.x), ...lr2.items.map((it) => it.x));
+      const spanX2 = Math.max(
+        ...lr1.items.map((it) => it.x + it.width),
+        ...lr2.items.map((it) => it.x + it.width)
+      );
+      if (hasPhysicalDividerBetween(lr1.yBottom, lr2.yTop, spanX1, spanX2)) {
+        i++;
+        continue;
+      }
+
       const sameCol = c1.colIndex === c2.colIndex;
       const sameX0 =
         tb1.sourceX0In !== undefined &&
@@ -4856,6 +5532,39 @@ export class Flat2008TablixCompiler {
       if (!sameCol && !sameX0) {
         i++;
         continue;
+      }
+
+      // Widen c1.colSpan cleanly if c2 spans further right over empty trailing cells in r1
+      const c1End = c1.colIndex + c1.colSpan - 1;
+      const c2End = c2.colIndex + c2.colSpan - 1;
+      if (c1.colIndex <= c2.colIndex && c2End > c1End) {
+        let canExtend = true;
+        for (let cc = c1End + 1; cc <= c2End; cc++) {
+          const trailCell = r1.cells[cc];
+          if (
+            !trailCell ||
+            trailCell.skipBecauseMerged ||
+            (trailCell.content.kind === 'Textbox' && trailCell.content.value.trim().length > 0) ||
+            trailCell.content.kind === 'Image' ||
+            trailCell.content.kind === 'Tablix'
+          ) {
+            canExtend = false;
+            break;
+          }
+        }
+        if (canExtend) {
+          c1.colSpan = c2End - c1.colIndex + 1;
+          for (let cc = c1End + 1; cc <= c2End; cc++) {
+            r1.cells[cc] = {
+              colIndex: cc,
+              rowIndex: r1.cells[cc].rowIndex,
+              colSpan: 1,
+              rowSpan: 1,
+              skipBecauseMerged: true,
+              content: { kind: 'Empty', name: `Merged_${r1.cells[cc].rowIndex}_${cc}` },
+            };
+          }
+        }
       }
 
       // Merge r2 into r1
@@ -4902,11 +5611,188 @@ export class Flat2008TablixCompiler {
       lr1.items = [...lr1.items, ...lr2.items];
       tablixRows.splice(i + 1, 1);
       emittedLogicalRows.splice(lrIdx2, 1);
+      anyMerged = true;
     }
 
-    for (let rIdx = 0; rIdx < tablixRows.length; rIdx++) {
-      for (const cell of tablixRows[rIdx].cells) {
-        cell.rowIndex = rIdx;
+    if (anyMerged) {
+      for (let rIdx = 0; rIdx < tablixRows.length; rIdx++) {
+        for (const cell of tablixRows[rIdx].cells) {
+          cell.rowIndex = rIdx;
+        }
+      }
+    }
+    return anyMerged;
+  }
+
+  private applyVectorMatchedCellBorders(
+    tablixRows: TablixRow[],
+    rectItems: PositionedItem[],
+    lineItems: PositionedItem[],
+    outerFrameRects: PositionedItem[],
+    logicalRows: LogicalRowBucket[],
+    atomicBoundaries: number[],
+    isDataTable: boolean,
+    hasBannerRow: boolean
+  ): void {
+    const firstBodyIdx = hasBannerRow ? 1 : 0;
+    const lastBodyIdx = tablixRows.length - 1;
+    if (lastBodyIdx < firstBodyIdx || logicalRows.length === 0) return;
+
+    const numCols = Math.max(1, atomicBoundaries.length - 1);
+    const noneEdge: CellBorderEdge = { style: 'None' };
+
+    const hSegs: Array<{ y: number; x0: number; x1: number; color: string; widthPt: number }> = [];
+    const vSegs: Array<{ x: number; y0: number; y1: number; color: string; widthPt: number }> = [];
+
+    for (const ln of lineItems) {
+      const col = ln.region.style.borderColor ?? ln.region.style.backgroundColor ?? '#94A3B8';
+      const wPt = Math.max(0.5, ln.region.style.borderWidthPt ?? 0.5);
+      if (ln.height <= ptToIn(3.5) && ln.width >= ptToIn(8)) {
+        hSegs.push({
+          y: ln.y + ln.height / 2,
+          x0: ln.x,
+          x1: ln.x + ln.width,
+          color: col,
+          widthPt: wPt,
+        });
+      } else if (ln.width <= ptToIn(3.5) && ln.height >= ptToIn(8)) {
+        vSegs.push({
+          x: ln.x + ln.width / 2,
+          y0: ln.y,
+          y1: ln.y + ln.height,
+          color: col,
+          widthPt: wPt,
+        });
+      }
+    }
+
+    for (const rc of rectItems) {
+      const col = rc.region.style.borderColor;
+      if (!col) continue;
+      const wPt = Math.max(0.5, rc.region.style.borderWidthPt ?? 0.5);
+      hSegs.push({ y: rc.y, x0: rc.x, x1: rc.x + rc.width, color: col, widthPt: wPt });
+      hSegs.push({ y: rc.y + rc.height, x0: rc.x, x1: rc.x + rc.width, color: col, widthPt: wPt });
+      vSegs.push({ x: rc.x, y0: rc.y, y1: rc.y + rc.height, color: col, widthPt: wPt });
+      vSegs.push({ x: rc.x + rc.width, y0: rc.y, y1: rc.y + rc.height, color: col, widthPt: wPt });
+    }
+
+    // [R-B-BOX]: Perimeter-only Solid on full-section outer frame boxes (plus any interior wide HLines)
+    if (!isDataTable && outerFrameRects.length > 0) {
+      const frameColor = outerFrameRects[0].region.style.borderColor ?? '#94A3B8';
+      const frameWidthPt = Math.max(0.5, outerFrameRects[0].region.style.borderWidthPt ?? 0.5);
+      const solidFrame: CellBorderEdge = { style: 'Solid', color: frameColor, widthPt: frameWidthPt };
+
+      for (let rIdx = firstBodyIdx; rIdx <= lastBodyIdx; rIdx++) {
+        const lrIdx = rIdx - firstBodyIdx;
+        const lr = logicalRows[lrIdx];
+        const prevLr = lrIdx > 0 ? logicalRows[lrIdx - 1] : undefined;
+        const row = tablixRows[rIdx];
+        for (const cell of row.cells) {
+          if (cell.skipBecauseMerged || cell.content.kind !== 'Textbox') continue;
+          const cx0 = atomicBoundaries[cell.colIndex] ?? 0;
+          const cx1 = atomicBoundaries[Math.min(numCols, cell.colIndex + cell.colSpan)] ?? cx0;
+          let topEdge: CellBorderEdge = rIdx === firstBodyIdx ? solidFrame : noneEdge;
+          if (rIdx > firstBodyIdx && lr && prevLr) {
+            const gapH = hSegs.find(
+              (h) =>
+                h.y >= prevLr.yBottom - ptToIn(2) &&
+                h.y <= lr.yTop + ptToIn(2) &&
+                Math.min(cx1, h.x1) - Math.max(cx0, h.x0) >= Math.max(ptToIn(4), (cx1 - cx0) * 0.7)
+            );
+            if (gapH) {
+              topEdge = { style: 'Solid', color: gapH.color, widthPt: gapH.widthPt };
+            }
+          }
+          cell.content.style.borderEdges = {
+            top: topEdge,
+            bottom: rIdx === lastBodyIdx ? solidFrame : noneEdge,
+            left: cell.colIndex === 0 ? solidFrame : noneEdge,
+            right: cell.colIndex + cell.colSpan >= numCols ? solidFrame : noneEdge,
+          };
+        }
+      }
+      return;
+    }
+
+    if (hSegs.length === 0 && vSegs.length === 0) {
+      return;
+    }
+
+    const posTolIn = ptToIn(2.5);
+    const findHMatch = (yMin: number, yMax: number, x0: number, x1: number): CellBorderEdge | undefined => {
+      const spanX = Math.max(ptToIn(4), x1 - x0);
+      const minCov = Math.max(ptToIn(4), spanX * 0.7);
+      let best: { dist: number; seg: (typeof hSegs)[number] } | undefined;
+      const yMid = (yMin + yMax) / 2;
+      for (const h of hSegs) {
+        if (h.y < yMin - posTolIn || h.y > yMax + posTolIn) continue;
+        const overlapX = Math.min(x1, h.x1) - Math.max(x0, h.x0);
+        if (overlapX < minCov) continue;
+        const d = Math.abs(h.y - yMid);
+        if (!best || d < best.dist) {
+          best = { dist: d, seg: h };
+        }
+      }
+      return best ? { style: 'Solid', color: best.seg.color, widthPt: best.seg.widthPt } : undefined;
+    };
+
+    const findVMatch = (xTarget: number, y0: number, y1: number): CellBorderEdge | undefined => {
+      const spanY = Math.max(ptToIn(4), y1 - y0);
+      const minCov = Math.max(ptToIn(4), spanY * 0.7);
+      let best: { dist: number; seg: (typeof vSegs)[number] } | undefined;
+      for (const v of vSegs) {
+        const d = Math.abs(v.x - xTarget);
+        if (d > posTolIn) continue;
+        const overlapY = Math.min(y1, v.y1) - Math.max(y0, v.y0);
+        if (overlapY < minCov) continue;
+        if (!best || d < best.dist) {
+          best = { dist: d, seg: v };
+        }
+      }
+      return best ? { style: 'Solid', color: best.seg.color, widthPt: best.seg.widthPt } : undefined;
+    };
+
+    for (let rIdx = firstBodyIdx; rIdx <= lastBodyIdx; rIdx++) {
+      const lrIdx = rIdx - firstBodyIdx;
+      const lr = logicalRows[lrIdx];
+      if (!lr) continue;
+      const prevLr = lrIdx > 0 ? logicalRows[lrIdx - 1] : undefined;
+      const nextLr = lrIdx + 1 < logicalRows.length ? logicalRows[lrIdx + 1] : undefined;
+      const rowIsRuledGrid = isDataTable || Boolean(lr.isSubTableRow);
+
+      const topYMin = prevLr
+        ? rowIsRuledGrid
+          ? lr.yTop
+          : (prevLr.yBottom + lr.yTop) / 2
+        : lr.yTop - ptToIn(6);
+      const topYMax = lr.yTop;
+
+      const botYMin = lr.yBottom;
+      const botYMax = nextLr
+        ? rowIsRuledGrid
+          ? lr.yBottom
+          : (lr.yBottom + nextLr.yTop) / 2 - ptToIn(0.5)
+        : lr.yBottom + ptToIn(6);
+
+      const row = tablixRows[rIdx];
+      for (const cell of row.cells) {
+        if (cell.skipBecauseMerged || cell.content.kind !== 'Textbox') continue;
+        const cx0 = atomicBoundaries[cell.colIndex] ?? 0;
+        const cx1 = atomicBoundaries[Math.min(numCols, cell.colIndex + cell.colSpan)] ?? cx0;
+
+        const topEdge = findHMatch(topYMin, topYMax, cx0, cx1);
+        const botEdge = findHMatch(botYMin, botYMax, cx0, cx1);
+        const leftEdge = findVMatch(cx0, lr.yTop, lr.yBottom);
+        const rightEdge = findVMatch(cx1, lr.yTop, lr.yBottom);
+
+        if (topEdge || botEdge || leftEdge || rightEdge) {
+          cell.content.style.borderEdges = {
+            top: topEdge ?? noneEdge,
+            bottom: botEdge ?? noneEdge,
+            left: leftEdge ?? noneEdge,
+            right: rightEdge ?? noneEdge,
+          };
+        }
       }
     }
   }
@@ -4936,18 +5822,42 @@ export class Flat2008TablixCompiler {
       });
       if (!subsequentAllEmpty) return;
 
+      const lastRowCell = tablixRows[rowIndices[rowIndices.length - 1]]?.cells[targetCol];
+      const firstEdges = firstRowCell.content.style.borderEdges;
+      const lastEdges =
+        lastRowCell && lastRowCell.content.kind === 'Textbox' ? lastRowCell.content.style.borderEdges : undefined;
+      const fallbackColor = firstRowCell.content.style.borderColor;
+      const fallbackWidth = firstRowCell.content.style.borderWidthPt ?? 0.5;
+      const fallbackSolid: CellBorderEdge | undefined = fallbackColor
+        ? { style: 'Solid', color: fallbackColor, widthPt: fallbackWidth }
+        : undefined;
+      const noneEdge: CellBorderEdge = { style: 'None' };
+
+      const topEdge = firstEdges?.top ?? fallbackSolid ?? noneEdge;
+      const bottomEdge = lastEdges?.bottom ?? fallbackSolid ?? noneEdge;
+
       for (let k = 0; k < rowIndices.length; k++) {
         const cell = tablixRows[rowIndices[k]].cells[targetCol];
         if (cell.content.kind !== 'Textbox') continue;
-        const borderCol = cell.content.style.borderColor ?? '#D0D7DE';
-        const borderW = cell.content.style.borderWidthPt ?? 0.5;
-        const solidEdge: CellBorderEdge = { style: 'Solid', color: borderCol, widthPt: borderW };
-        const noneEdge: CellBorderEdge = { style: 'None' };
+        const curEdges = cell.content.style.borderEdges;
+        const leftEdge = curEdges?.left ?? firstEdges?.left ?? fallbackSolid ?? noneEdge;
+        const rightEdge = curEdges?.right ?? firstEdges?.right ?? fallbackSolid ?? noneEdge;
+        const rowTop = k === 0 ? topEdge : noneEdge;
+        const rowBot = k === rowIndices.length - 1 ? bottomEdge : noneEdge;
+        if (
+          leftEdge.style === 'None' &&
+          rightEdge.style === 'None' &&
+          rowTop.style === 'None' &&
+          rowBot.style === 'None'
+        ) {
+          cell.content.style.borderEdges = undefined;
+          continue;
+        }
         cell.content.style.borderEdges = {
-          left: solidEdge,
-          right: solidEdge,
-          top: k === 0 ? solidEdge : noneEdge,
-          bottom: k === rowIndices.length - 1 ? solidEdge : noneEdge,
+          left: leftEdge,
+          right: rightEdge,
+          top: rowTop,
+          bottom: rowBot,
         };
       }
     };
@@ -4977,7 +5887,7 @@ export class Flat2008TablixCompiler {
       suppressVerticalGroup(spannedRowIndices, targetCol);
     }
 
-    // Pass B: In structured data tables, merge consecutive empty-below group label cells (e.g. "Dana Mapan", "3 Tahun")
+    // Pass B: In structured data tables, merge consecutive empty-below group label cells
     // when no horizontal vector line separates the rows inside that column.
     if (!isDataTable || numCols < 3) return;
     const horizLines = lineItems.filter((ln) => ln.height <= ptToIn(3) && ln.width >= ptToIn(10));
@@ -5005,8 +5915,7 @@ export class Flat2008TablixCompiler {
           !cell ||
           cell.skipBecauseMerged ||
           cell.content.kind !== 'Textbox' ||
-          !cell.content.value.trim() ||
-          cell.content.style.borderEdges
+          !cell.content.value.trim()
         ) {
           lrIdx++;
           continue;

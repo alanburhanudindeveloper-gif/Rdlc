@@ -159,11 +159,16 @@ export class TablixBuilder {
       bindSpecTextboxes(flatResult.pageHeaderSpec);
       bindSpecTextboxes(flatResult.pageFooterSpec);
 
-      for (const tbl of flatResult.bodyTablixes) {
+      const parameterizeTablix = (tbl: TablixRegion) => {
         for (const row of tbl.rows) {
           let prevCellLabel: string | undefined;
           for (const cell of row.cells) {
-            if (cell.skipBecauseMerged || cell.content.kind !== 'Textbox') continue;
+            if (cell.skipBecauseMerged) continue;
+            if (cell.content.kind === 'Tablix') {
+              parameterizeTablix(cell.content.tablix);
+              continue;
+            }
+            if (cell.content.kind !== 'Textbox') continue;
             const tb = cell.content;
             if (tb.isExpression || tb.value.trim().startsWith('=')) continue;
             if (tb.paragraphLines && tb.paragraphLines.length > 0) {
@@ -180,6 +185,9 @@ export class TablixBuilder {
             }
           }
         }
+      };
+      for (const tbl of flatResult.bodyTablixes) {
+        parameterizeTablix(tbl);
       }
       if (paramCtx.parameters.size === 0) {
         paramCtx.parameters.set('ReportTitle', {

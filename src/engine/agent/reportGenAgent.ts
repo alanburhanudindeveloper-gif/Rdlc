@@ -33,6 +33,7 @@ export interface AgentRunInput {
   autoCalibrate?: boolean;
   pinnedDocs?: PinnedCalibrationDoc[];
   preAnalyzedLayout?: IntermediateLayoutModel;
+  visualSimilarityTarget?: number;
 }
 
 /**
@@ -197,18 +198,20 @@ export class ReportGenAgent {
 
     // Step 7: Visual parity comparison (Original PDF vs Rendered RDLC PDF or supplied comparisonPdf)
     const comparisonTarget = input.comparisonPdfBytes ?? renderedPdfBytes;
+    const effectiveSimilarityTarget =
+      input.visualSimilarityTarget ?? config.validation.visualSimilarityTarget ?? 0.95;
     const visualDiff =
       input.pdfBytes.byteLength > 0
         ? await this.services.visualDiff.comparePdfs(
             input.pdfBytes,
             comparisonTarget,
-            config.validation.visualSimilarityTarget,
+            effectiveSimilarityTarget,
             undefined,
             config.pdf.dpi
           )
         : {
             available: false,
-            targetSimilarity: config.validation.visualSimilarityTarget ?? 0.95,
+            targetSimilarity: effectiveSimilarityTarget,
             overallSimilarity: 0,
             overallParityPercent: 0,
             meanAbsoluteError: 0,
@@ -217,7 +220,7 @@ export class ReportGenAgent {
           };
 
     // Final Validation Gate: validate XML structure + runtime 1:1 page parity, 0 collisions, 0 clipped rows
-    const targetPct = Math.round((config.validation.visualSimilarityTarget ?? 0.95) * 10000) / 100;
+    const targetPct = Math.round(effectiveSimilarityTarget * 10000) / 100;
     const pageSpilloverSummary = previewHtml.pageSpillovers.map(
       (s) =>
         `P${s.sourcePage}->${s.renderedPages}pp (${s.compiledHeightPt.toFixed(0)}/${s.availableBodyHeightPt.toFixed(0)}pt)`

@@ -262,7 +262,7 @@ export class RdlcValidator {
 
     // 3. Recursively validate ReportItems across Body, PageHeader, PageFooter, nested Rectangles, and nested Tablixes
     let totalTablixes = 0;
-    const validateSingleTablix = (tbl: Record<string, unknown>, ctx: string) => {
+    const validateSingleTablix = (tbl: Record<string, unknown>, ctx: string, nestingDepth = 0) => {
       totalTablixes++;
       const tblName = String(tbl?.['@_Name'] ?? '');
       checkUniqueName(tblName, `${ctx}.Tablix(${tblName})`);
@@ -292,6 +292,14 @@ export class RdlcValidator {
             ruleId: 'RDLC-15',
             severity: 'ERROR',
             message: `Tablix "${tblName}" has invalid PageBreak BreakLocation "${loc}".`,
+            location: tblName,
+          });
+        }
+        if (is2008Mode && nestingDepth > 0) {
+          errors.push({
+            ruleId: 'RDLC-2008',
+            severity: 'ERROR',
+            message: `Nested <Tablix> "${tblName}" must not emit <PageBreak> ([R-PB]).`,
             location: tblName,
           });
         }
@@ -335,13 +343,22 @@ export class RdlcValidator {
 
       for (const rm of rowMembers) {
         const rmPb = (rm?.PageBreak as Record<string, unknown> | undefined)?.BreakLocation;
-        if (rmPb !== undefined && !['Start', 'End', 'Between'].includes(String(rmPb).trim())) {
-          errors.push({
-            ruleId: 'RDLC-15',
-            severity: 'ERROR',
-            message: `Tablix "${tblName}" row member has invalid PageBreak BreakLocation "${String(rmPb)}".`,
-            location: tblName,
-          });
+        if (rmPb !== undefined) {
+          if (!['Start', 'End', 'Between'].includes(String(rmPb).trim())) {
+            errors.push({
+              ruleId: 'RDLC-15',
+              severity: 'ERROR',
+              message: `Tablix "${tblName}" row member has invalid PageBreak BreakLocation "${String(rmPb)}".`,
+              location: tblName,
+            });
+          } else if (is2008Mode && nestingDepth > 0) {
+            errors.push({
+              ruleId: 'RDLC-2008',
+              severity: 'ERROR',
+              message: `Nested <Tablix> "${tblName}" row member must not emit <PageBreak> ([R-PB]).`,
+              location: tblName,
+            });
+          }
         }
       }
 
@@ -409,14 +426,23 @@ export class RdlcValidator {
             const nestedTbl = cc.Tablix as Record<string, unknown> | undefined;
             if (nestedTbl) {
               if (is2008Mode) {
-                errors.push({
-                  ruleId: 'RDLC-2008',
-                  severity: 'ERROR',
-                  message: `Strict RDLC 2008 forbids nested <Tablix> inside CellContents of "${tblName}" cell [${rIdx},${cIdx}].`,
-                  location: `${tblName}.Row[${rIdx}].Col[${cIdx}]`,
-                });
+                if (nestingDepth >= 1) {
+                  errors.push({
+                    ruleId: 'RDLC-2008',
+                    severity: 'ERROR',
+                    message: `RDLC 2008 allows max 1 level of nested <Tablix> ([R-PARENT-NESTED]); deeper nesting found in "${tblName}" cell [${rIdx},${cIdx}].`,
+                    location: `${tblName}.Row[${rIdx}].Col[${cIdx}]`,
+                  });
+                } else if (cols.length !== 2) {
+                  errors.push({
+                    ruleId: 'RDLC-2008',
+                    severity: 'ERROR',
+                    message: `Outer <Tablix> "${tblName}" with nested <Tablix> must have 2 columns for [R-PARENT-NESTED] (found ${cols.length}).`,
+                    location: `${tblName}.Row[${rIdx}].Col[${cIdx}]`,
+                  });
+                }
               }
-              validateSingleTablix(nestedTbl, `${tblName}.Cell[${rIdx},${cIdx}]`);
+              validateSingleTablix(nestedTbl, `${tblName}.Cell[${rIdx},${cIdx}]`, nestingDepth + 1);
             }
             const nestedRect = cc.Rectangle as Record<string, unknown> | undefined;
             if (nestedRect) {
@@ -597,7 +623,20 @@ export class RdlcValidator {
         removeNSPrefix: true,
       });
       const orderedTree = orderedParser.parse(rdlcXml) as Array<Record<string, unknown>>;
-      const expectedTablixOrder = [
+      const outerTablixOrderSeq = [
+        'TablixBody',
+        'TablixColumnHierarchy',
+        'TablixRowHierarchy',
+        'DataSetName',
+        'PageBreak',
+        'Top',
+        'Left',
+        'Height',
+        'Width',
+        'ZIndex',
+        'Style',
+      ];
+      const outerRequiredTags = new Set([
         'TablixBody',
         'TablixColumnHierarchy',
         'TablixRowHierarchy',
@@ -606,13 +645,36 @@ export class RdlcValidator {
         'Left',
         'Height',
         'Width',
-        'ZIndex',
+        'Style',
+      ]);
+      const nestedRequiredTags = [
+        'TablixBody',
+        'TablixColumnHierarchy',
+        'TablixRowHierarchy',
+        'DataSetName',
+        'Height',
+        'Width',
         'Style',
       ];
       const getOrderedTag = (node: Record<string, unknown>): string | undefined =>
         Object.keys(node).find((k) => k !== ':@' && k !== '#text' && !k.startsWith('?'));
 
-      const inspectOrderedNodes = (nodes: Array<Record<string, unknown>>) => {
+      const matchesOrderedSubsequence = (actual: string[], allowedSeq: string[], required: Set<string>): boolean => {
+        for (const req of required) {
+          if (!actual.includes(req)) return false;
+        }
+        let seqIdx = 0;
+        for (const tag of actual) {
+          while (seqIdx < allowedSeq.length && allowedSeq[seqIdx] !== tag) {
+            seqIdx++;
+          }
+          if (seqIdx >= allowedSeq.length) return false;
+          seqIdx++;
+        }
+        return true;
+      };
+
+      const inspectOrderedNodes = (nodes: Array<Record<string, unknown>>, insideCellContents = false) => {
         for (const node of nodes) {
           const tag = getOrderedTag(node);
           if (!tag) continue;
@@ -624,14 +686,23 @@ export class RdlcValidator {
             const childTags = children
               .map((ch) => getOrderedTag(ch))
               .filter((t): t is string => Boolean(t));
-            if (
-              childTags.length !== expectedTablixOrder.length ||
-              expectedTablixOrder.some((exp, idx) => childTags[idx] !== exp)
-            ) {
+            if (insideCellContents) {
+              if (
+                childTags.length !== nestedRequiredTags.length ||
+                nestedRequiredTags.some((exp, idx) => childTags[idx] !== exp)
+              ) {
+                errors.push({
+                  ruleId: 'RDLC-2008',
+                  severity: 'ERROR',
+                  message: `Nested Tablix "${tblName}" direct children (${childTags.join(', ')}) violate RDLC 2008 XSD order (${nestedRequiredTags.join(', ')}).`,
+                  location: tblName,
+                });
+              }
+            } else if (!matchesOrderedSubsequence(childTags, outerTablixOrderSeq, outerRequiredTags)) {
               errors.push({
                 ruleId: 'RDLC-2008',
                 severity: 'ERROR',
-                message: `Tablix "${tblName}" direct children (${childTags.join(', ')}) violate RDLC 2008 XSD order (${expectedTablixOrder.join(', ')}).`,
+                message: `Tablix "${tblName}" direct children (${childTags.join(', ')}) violate RDLC 2008 XSD order (${outerTablixOrderSeq.join(', ')}).`,
                 location: tblName,
               });
             }
@@ -650,11 +721,11 @@ export class RdlcValidator {
             }
           }
           if (children.length > 0) {
-            inspectOrderedNodes(children);
+            inspectOrderedNodes(children, tag === 'CellContents');
           }
         }
       };
-      inspectOrderedNodes(orderedTree);
+      inspectOrderedNodes(orderedTree, false);
 
       const bodyItems2008 = (body?.ReportItems ?? {}) as Record<string, unknown>;
       const top2008Tablixes = asArray(
@@ -710,7 +781,7 @@ export class RdlcValidator {
           });
         }
 
-        for (const tbl of top2008Tablixes) {
+        const verifyTablixCanGrow2008 = (tbl: Record<string, unknown>) => {
           const tblName = String(tbl?.['@_Name'] ?? '');
           const tRows = ((tbl?.TablixBody as Record<string, unknown> | undefined)?.TablixRows as
             | Record<string, unknown>
@@ -722,9 +793,11 @@ export class RdlcValidator {
                 | Record<string, unknown>[]
             );
             for (const cell of cells) {
-              const tb = (cell?.CellContents as Record<string, unknown> | undefined)?.Textbox as
-                | Record<string, unknown>
-                | undefined;
+              const cc = cell?.CellContents as Record<string, unknown> | undefined;
+              if (cc?.Tablix) {
+                verifyTablixCanGrow2008(cc.Tablix as Record<string, unknown>);
+              }
+              const tb = cc?.Textbox as Record<string, unknown> | undefined;
               if (!tb) continue;
               const tbName = String(tb?.['@_Name'] ?? 'Textbox');
               const canGrow = String(tb?.CanGrow ?? '').trim().toLowerCase();
@@ -740,6 +813,9 @@ export class RdlcValidator {
               }
             }
           }
+        };
+        for (const tbl of top2008Tablixes) {
+          verifyTablixCanGrow2008(tbl);
         }
       }
     }

@@ -677,6 +677,19 @@ export class RdlcVisualPreviewRenderer {
             if (rr !== rIdx || ccIdx !== cIdx) covered[rr][ccIdx] = true;
           }
         }
+        const subTbl = childOf(cc, 'Tablix');
+        if (subTbl) {
+          const nestedHeights = this.measureTablixRowHeightsForPagination(subTbl, ctx, pageNum);
+          const neededH = nestedHeights.reduce((a, b) => a + b, 0);
+          const curSpanH = rowHeightsPt
+            .slice(rIdx, Math.min(expandedRows.length, rIdx + rs))
+            .reduce((a, b) => a + b, 0);
+          if (neededH > curSpanH) {
+            const targetRow = Math.min(expandedRows.length - 1, rIdx + rs - 1);
+            rowHeightsPt[targetRow] += neededH - curSpanH;
+          }
+          return;
+        }
         const tb = childOf(cc, 'Textbox');
         if (!tb || textOf(tb, 'CanGrow').trim().toLowerCase() === 'false') return;
         const spanW = colWidthsPt
@@ -1341,7 +1354,8 @@ export class RdlcVisualPreviewRenderer {
               `<td${spanAttrs} style="${bgCss}${borderCss(st)}${padCss}vertical-align:${vAlign};box-sizing:border-box;">${inner}</td>`
             );
           });
-          if (maxRequiredRowPt > declaredRowPt + 2.5 && clipPreviewText) {
+          const effectiveRowPt = Math.max(declaredRowPt, maxRequiredRowPt);
+          if (maxRequiredRowPt > declaredRowPt + 12.0 && clipPreviewText) {
             clippedRows.push({
               page: pageNum,
               tablixName: attrOf(tblNode, 'Name') || name,
@@ -1351,7 +1365,7 @@ export class RdlcVisualPreviewRenderer {
               textPreview: clipPreviewText,
             });
           }
-          return `<tr style="height:${rH};">${tds.join('')}</tr>`;
+          return `<tr style="height:${Math.round(effectiveRowPt * 10) / 10}pt;">${tds.join('')}</tr>`;
         })
         .join('');
 

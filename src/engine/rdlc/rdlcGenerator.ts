@@ -699,9 +699,7 @@ ${cellsXml}
 
     const rowMembersXml = tablix.rows
       .map((row, idx) => {
-        const wantsBreak =
-          (idx > 0 && row.pageBreakBefore) ||
-          (is2008 && !nested && idx === 0 && tablix.pageBreakBefore);
+        const wantsBreak = !is2008 && idx > 0 && row.pageBreakBefore;
         const memberPb = wantsBreak
           ? '\n                <PageBreak><BreakLocation>Start</BreakLocation></PageBreak>'
           : '';
@@ -718,6 +716,13 @@ ${cellsXml}
 
     if (is2008) {
       const zIdx = tablix.zIndex ?? 1;
+      const pb2008Xml =
+        !nested && tablix.pageBreakBefore
+          ? '\n            <PageBreak><BreakLocation>Start</BreakLocation></PageBreak>'
+          : '';
+      const pos2008Xml = nested
+        ? `\n            <Height>${fmtSz(tablix.heightIn, 0.05)}</Height>\n            <Width>${fmtSz(tablix.widthIn, 0.05)}</Width>`
+        : `\n            <Top>${fmtPos(tablix.topIn)}</Top>\n            <Left>${fmtPos(tablix.leftIn)}</Left>\n            <Height>${fmtSz(tablix.heightIn, 0.05)}</Height>\n            <Width>${fmtSz(tablix.widthIn, 0.05)}</Width>\n            <ZIndex>${zIdx}</ZIndex>`;
       return `          <Tablix Name="${escapeXml(tablix.name)}">
             <TablixBody>
               <TablixColumns>
@@ -737,12 +742,7 @@ ${colMembersXml}
 ${rowMembersXml}
               </TablixMembers>
             </TablixRowHierarchy>
-            <DataSetName>${escapeXml(tablix.dataSetName ?? definition.dataSetName)}</DataSetName>
-            <Top>${fmtPos(tablix.topIn)}</Top>
-            <Left>${fmtPos(tablix.leftIn)}</Left>
-            <Height>${fmtSz(tablix.heightIn, 0.05)}</Height>
-            <Width>${fmtSz(tablix.widthIn, 0.05)}</Width>
-            <ZIndex>${zIdx}</ZIndex>
+            <DataSetName>${escapeXml(tablix.dataSetName ?? definition.dataSetName)}</DataSetName>${pb2008Xml}${pos2008Xml}
             <Style>
               <Border>
                 <Style>None</Style>

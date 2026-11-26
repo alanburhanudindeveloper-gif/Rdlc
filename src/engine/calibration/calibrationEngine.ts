@@ -352,42 +352,44 @@ function applyPageSpilloverRepairStep(
   const aggressiveCompact = ratio < 0.92;
 
   let mutated = false;
-  if (curPadV > 0.5) {
+  if (curPadV > 0.25) {
     const targetPadV = aggressiveCompact
-      ? 0.5
-      : Math.max(0.5, Math.round(Math.min(curPadV - 1.0, curPadV * ratio) * 100) / 100);
+      ? Math.max(0.25, Math.round(curPadV * 0.5 * 100) / 100)
+      : Math.max(0.25, Math.round(Math.min(curPadV - 1.0, curPadV * ratio) * 100) / 100);
     if (targetPadV < curPadV) {
       pageOverride.cellPadVerticalPt = targetPadV;
       mutated = true;
     }
   }
-  if (curGap > 1.0) {
+  if (curGap > 0.5) {
     const targetGap = aggressiveCompact
-      ? 1.0
-      : Math.max(1.0, Math.round(Math.min(curGap - 1.5, curGap * ratio) * 100) / 100);
+      ? 0.5
+      : Math.max(0.5, Math.round(Math.min(curGap - 1.5, curGap * ratio) * 100) / 100);
     if (targetGap < curGap) {
       pageOverride.sectionGapPt = targetGap;
       mutated = true;
     }
   }
-  if (curLH > 1.06) {
+  if (curLH > 1.02) {
     let targetLH = curLH;
     if (curLH > 1.12) {
       targetLH = aggressiveCompact
-        ? 1.12
-        : Math.max(1.12, Math.round(Math.min(curLH - 0.08, curLH * Math.max(0.84, ratio)) * 100) / 100);
-    } else {
+        ? 1.1
+        : Math.max(1.1, Math.round(Math.min(curLH - 0.08, curLH * Math.max(0.84, ratio)) * 100) / 100);
+    } else if (curLH > 1.06) {
       targetLH = 1.06;
+    } else {
+      targetLH = 1.02;
     }
     if (targetLH < curLH) {
       pageOverride.lineHeightMultiplier = targetLH;
       mutated = true;
     }
   }
-  if (curMinRowH > 7.5) {
+  if (curMinRowH > 6.8) {
     const targetMinRowH = aggressiveCompact
-      ? 7.5
-      : Math.max(7.5, Math.round(Math.min(curMinRowH - 2.0, curMinRowH * ratio) * 10) / 10);
+      ? Math.max(6.8, Math.round(Math.min(7.5, curMinRowH * ratio) * 10) / 10)
+      : Math.max(6.8, Math.round(Math.min(curMinRowH - 2.0, curMinRowH * ratio) * 10) / 10);
     if (targetMinRowH < curMinRowH) {
       pageOverride.minRowHeightPt = targetMinRowH;
       mutated = true;
