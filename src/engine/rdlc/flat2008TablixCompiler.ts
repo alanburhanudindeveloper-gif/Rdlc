@@ -268,8 +268,10 @@ export interface Flat2008CompileOutput {
   hierarchy: RdlcDocumentHierarchy;
 }
 
-const CLAUSE_TITLE_WITH_MARKER_RE = /^(\d+(?:\.\d+)*\.|\(\d+\)|\([a-z]{1,3}\)|(?:i{1,3}|iv|vi{0,3}|ix|x)\.|[a-z]\.|[•\u2022\-–])\s+(.+)$/i;
-const STANDALONE_MARKER_RE = /^(\d+(?:\.\d+)*\.|\(\d+\)|\([a-z]{1,3}\)|(?:i{1,3}|iv|vi{0,3}|ix|x)\.|[a-z]\.|[•\u2022\-–])$/i;
+const CLAUSE_TITLE_WITH_MARKER_RE =
+  /^(\d+(?:\.\d+)*\.|\(\d+\)|\([a-z]{1,2}\)|\((?:i{1,3}|iv|v|vi{0,3}|ix|x)\)|(?:i{1,3}|iv|vi{0,3}|ix|x|I{1,3}|IV|VI{0,3}|IX|X)\.|[a-zA-Z]\.|[•\u2022\-–])\s+(.+)$/;
+const STANDALONE_MARKER_RE =
+  /^(\d+(?:\.\d+)*\.|\(\d+\)|\([a-z]{1,2}\)|\((?:i{1,3}|iv|v|vi{0,3}|ix|x)\)|(?:i{1,3}|iv|vi{0,3}|ix|x|I{1,3}|IV|VI{0,3}|IX|X)\.|[a-zA-Z]\.|[•\u2022\-–])$/;
 
 function resolvePageCompilerWeights(
   weights: CompilerWeights,
@@ -1434,8 +1436,40 @@ export class Flat2008TablixCompiler {
         }
       }
 
+      const inlineOpRe = /^(.{2,42}?)\s*([:=])\s+(.+)$/;
+      const prefixOpRe = /^([:=])(?:\s+.*)?$/;
+      const analyzeSideKv = (sideTexts: PositionedItem[]) => {
+        const opXs: number[] = [];
+        for (const it of sideTexts) {
+          const t = (it.region.text ?? '').trim();
+          if (prefixOpRe.test(t)) {
+            opXs.push(it.x);
+          } else {
+            const m = t.match(inlineOpRe);
+            if (m) {
+              const ratio = (m[1].length + 0.5) / Math.max(1, t.length);
+              opXs.push(it.x + it.width * ratio);
+            }
+          }
+        }
+        const clusters = clusterValues(opXs, ptToIn(2.5));
+        const alignedOps = clusters.filter(
+          (cx) => opXs.filter((x) => Math.abs(x - cx) <= ptToIn(2.5)).length >= 2
+        );
+        const firstOpX = alignedOps[0] ?? (opXs.length > 0 ? Math.min(...opXs) : undefined);
+        const hasLabelBeforeOp =
+          firstOpX === undefined
+            ? true
+            : sideTexts.some(
+                (it) =>
+                  it.x + it.width <= firstOpX - ptToIn(2) &&
+                  !prefixOpRe.test((it.region.text ?? '').trim())
+              );
+        return { opCount: opXs.length, alignedOpCount: alignedOps.length, hasLabelBeforeOp };
+      };
+
       let bestCenter: number | undefined;
-      let bestGap = 0;
+      let bestScore = -Infinity;
       for (let i = 0; i < mergedX.length - 1; i++) {
         const gap = mergedX[i + 1].x1 - mergedX[i].x2;
         const center = (mergedX[i].x2 + mergedX[i + 1].x1) / 2;
@@ -1467,12 +1501,37 @@ export class Flat2008TablixCompiler {
         const rightV = rightSide.filter((it) => it.kind === 'line' && it.width <= ptToIn(3.5) && it.height >= ptToIn(12)).length;
         const leftR = leftSide.filter((it) => it.kind === 'rect' && it.height >= ptToIn(10)).length;
         const rightR = rightSide.filter((it) => it.kind === 'rect' && it.height >= ptToIn(10)).length;
+
+        const leftKv = analyzeSideKv(leftTexts);
+        const rightKv = analyzeSideKv(rightTexts);
+
+        // Reject splitting inside an intra-KV gap where rightSide starts at ':'/'=' with no labels left of ':'
+        if (rightKv.opCount >= 1 && !rightKv.hasLabelBeforeOp && !(leftV >= 2 && rightV >= 2)) {
+          continue;
+        }
+
         const hasPairedStructure =
           (leftV >= 2 && rightV >= 2) ||
           (leftR >= 2 && rightR >= 2) ||
+          (leftKv.opCount >= 1 && rightKv.opCount >= 1 && leftKv.hasLabelBeforeOp && rightKv.hasLabelBeforeOp) ||
           (leftTexts.length >= 3 && rightTexts.length >= 3);
-        if (hasPairedStructure && gap > bestGap) {
-          bestGap = gap;
+        if (!hasPairedStructure) continue;
+
+        const bothKvBonus =
+          leftKv.opCount >= 1 && rightKv.opCount >= 1 && leftKv.hasLabelBeforeOp && rightKv.hasLabelBeforeOp
+            ? 60
+            : 0;
+        const bothGridBonus = leftV >= 2 && rightV >= 2 ? 50 : 0;
+        const centralityPenalty = Math.abs(inToPt(center - maxBudgetWidthIn / 2)) * 1.4;
+        const score =
+          inToPt(gap) +
+          bothKvBonus +
+          bothGridBonus +
+          Math.min(leftTexts.length, rightTexts.length) * 3 -
+          centralityPenalty;
+
+        if (score > bestScore) {
+          bestScore = score;
           bestCenter = roundIn(center);
         }
       }
@@ -1885,7 +1944,8 @@ export class Flat2008TablixCompiler {
         }
 
         const minGutterW = ptToIn(Math.max(6, weights.minCenterGutterPt));
-        let bestGutter: { center: number; width: number } | undefined;
+        const prefixOpRe = /^([:=])(?:\s+.*)?$/;
+        let bestGutter: { center: number; score: number } | undefined;
         for (let i = 0; i < mergedX.length - 1; i++) {
           const gapLeft = mergedX[i].x2;
           const gapRight = mergedX[i + 1].x1;
@@ -1917,10 +1977,19 @@ export class Flat2008TablixCompiler {
             if (x0R - x1L < ptToIn(weights.minCenterGutterPt)) continue;
           }
 
-          const leftCount = contentItems.filter((it) => it.x < center).length;
-          const rightCount = contentItems.filter((it) => it.x >= center).length;
-          if (leftCount >= 3 && rightCount >= 3 && (!bestGutter || gutterW > bestGutter.width)) {
-            bestGutter = { center: roundIn(center), width: gutterW };
+          const leftItems = contentItems.filter((it) => it.x < center);
+          const rightItems = contentItems.filter((it) => it.x >= center);
+          const rightAllPrefixColon =
+            rightItems.length > 0 &&
+            rightItems.every((it) => prefixOpRe.test((it.region.text ?? '').trim()));
+          if (rightAllPrefixColon) continue;
+
+          const score =
+            inToPt(gutterW) +
+            Math.min(leftItems.length, rightItems.length) * 3 -
+            Math.abs(inToPt(center - maxBudgetWidthIn / 2)) * 1.4;
+          if (leftItems.length >= 3 && rightItems.length >= 3 && (!bestGutter || score > bestGutter.score)) {
+            bestGutter = { center: roundIn(center), score };
           }
         }
         return bestGutter?.center;
@@ -2893,10 +2962,16 @@ export class Flat2008TablixCompiler {
             ? 'HLINE_OPERATOR_EQUATION_SOLVER'
             : 'INDENTATION_CLAUSE_SOLVER';
       }
-      const preparedItems =
-        selectedStrategy === 'HLINE_OPERATOR_EQUATION_SOLVER' || signature.operatorColumnCount >= 1
-          ? this.splitOperatorAlignedTokens(contentItems, weights)
+      const justifiedMergedItems =
+        selectedStrategy !== 'PLANAR_GRID_SOLVER'
+          ? this.mergeJustifiedSameLineWords(contentItems, tableRects, lineItems, weights)
           : contentItems;
+      const preparedItems =
+        selectedStrategy === 'HLINE_OPERATOR_EQUATION_SOLVER' ||
+        selectedStrategy === 'KEY_VALUE_SUBGRID_FLATTENER' ||
+        signature.operatorColumnCount >= 1
+          ? this.splitOperatorAlignedTokens(justifiedMergedItems, weights)
+          : justifiedMergedItems;
       const expandedContentItems = this.expandMultilineItems(preparedItems);
       const rawRows = this.clusterItemsIntoRows(expandedContentItems, tableRects, weights);
       const markedRows = this.splitClauseTitleRows(rawRows);
@@ -3509,40 +3584,51 @@ export class Flat2008TablixCompiler {
         ln.x >= ptToIn(4) &&
         ln.x <= blockW - ptToIn(4)
     );
+    const effectiveRects = this.filterNonInsetGridRects(tableRects, vLines);
     const rectInteriorXs = clusterValues(
-      tableRects
+      effectiveRects
         .flatMap((rc) => [clamp(rc.x, 0, blockW), clamp(rc.x + rc.width, 0, blockW)])
         .filter((x) => x > ptToIn(6) && x < blockW - ptToIn(6)),
       ptToIn(2.5)
     );
     const shadedRowBandCount = rowFillBands.length;
-    // Check localized embedded sub-grid (cluster of tableRects/vLines spanning < 65% of container Y)
+    // [R-SUBGRID-STACK]: Check localized embedded sub-grid (rects or vLine zones with KV/outside text)
     let hasEmbeddedSubGrid = false;
-    if (tableRects.length >= 2 && contentSpanY > 0) {
-      const sortedRects = [...tableRects].sort((a, b) => a.y - b.y);
-      const zones: Array<{ yTop: number; yBottom: number; rects: PositionedItem[] }> = [];
-      for (const rc of sortedRects) {
+    if ((effectiveRects.length >= 2 || vLines.length >= 2) && contentSpanY > 0) {
+      const sortedElems = [...effectiveRects, ...vLines].sort((a, b) => a.y - b.y);
+      const zones: Array<{ yTop: number; yBottom: number; elems: PositionedItem[]; rects: PositionedItem[] }> = [];
+      for (const el of sortedElems) {
         const last = zones[zones.length - 1];
-        if (last && rc.y <= last.yBottom + ptToIn(6)) {
-          last.yBottom = Math.max(last.yBottom, rc.y + rc.height);
-          last.rects.push(rc);
+        if (last && el.y <= last.yBottom + ptToIn(6)) {
+          last.yBottom = Math.max(last.yBottom, el.y + el.height);
+          last.elems.push(el);
+          if (el.kind === 'rect') last.rects.push(el);
         } else {
-          zones.push({ yTop: rc.y, yBottom: rc.y + rc.height, rects: [rc] });
+          zones.push({
+            yTop: el.y,
+            yBottom: el.y + el.height,
+            elems: [el],
+            rects: el.kind === 'rect' ? [el] : [],
+          });
         }
       }
       hasEmbeddedSubGrid = zones.some((z) => {
-        if (z.rects.length < 2) return false;
-        if (z.yBottom - z.yTop >= contentSpanY * 0.65) return false;
+        if (z.elems.length < 2) return false;
+        const zoneSpanY = z.yBottom - z.yTop;
+        if (zoneSpanY >= contentSpanY * 0.72) return false;
         const xs = clusterValues(
-          z.rects.flatMap((r) => [clamp(r.x, 0, blockW), clamp(r.x + r.width, 0, blockW)]),
+          z.elems.flatMap((el) =>
+            el.kind === 'line' ? [clamp(el.x, 0, blockW)] : [clamp(el.x, 0, blockW), clamp(el.x + el.width, 0, blockW)]
+          ),
           ptToIn(2.5)
         );
-        const ys = clusterValues(z.rects.flatMap((r) => [r.y, r.y + r.height]), ptToIn(weights.yRowClusterTolPt));
+        const zoneMinX = xs.length > 0 ? Math.min(...xs) : 0;
         const outsideCount = contentItems.filter((it) => {
           const cy = it.y + it.height / 2;
-          return cy < z.yTop - ptToIn(4) || cy > z.yBottom + ptToIn(4);
+          const cx = it.x + it.width / 2;
+          return cy < z.yTop - ptToIn(4) || cy > z.yBottom + ptToIn(4) || cx < zoneMinX - ptToIn(6);
         }).length;
-        return xs.length >= 3 && ys.length >= 2 && outsideCount >= 2;
+        return xs.length >= 3 && (outsideCount >= 2 || zoneMinX >= blockW * 0.18);
       });
     }
 
@@ -3550,7 +3636,7 @@ export class Flat2008TablixCompiler {
 
     // Count distinct recurring left-edge x0 indentation tracks
     const textItems = contentItems.filter((it) => it.kind === 'text');
-    const rowBuckets = this.clusterItemsIntoRows(textItems, tableRects, weights);
+    const rowBuckets = this.clusterItemsIntoRows(textItems, effectiveRects, weights);
     const indentCandidates: number[] = [];
     for (const rb of rowBuckets) {
       if (rb.items.length === 0) continue;
@@ -3564,13 +3650,18 @@ export class Flat2008TablixCompiler {
 
     const denseRowsCount = rowBuckets.filter((r) => r.items.filter((i) => i.kind === 'text').length >= 4).length;
 
-    // Count aligned ':' or '=' operator tokens across >= 2 rows (ignore stray punctuation in dense multi-col numeric tables)
+    // Count aligned ':' or '=' operator tokens across >= 2 rows (including prefix ': Value' spans)
     const operatorXs: number[] = [];
-    if (internalVLineCount < 3 && denseRowsCount < 3) {
+    if ((internalVLineCount < 3 || hasEmbeddedSubGrid) && denseRowsCount < 4) {
       for (const rb of rowBuckets) {
         for (const it of rb.items) {
           const txt = (it.region.text ?? '').trim();
           if (txt === ':' || txt === '=') {
+            operatorXs.push(it.x);
+            continue;
+          }
+          const prefixMatch = txt.match(/^([:=])\s+(.+)$/);
+          if (prefixMatch) {
             operatorXs.push(it.x);
             continue;
           }
@@ -3622,16 +3713,144 @@ export class Flat2008TablixCompiler {
     if (sig.columnDensityDrop) {
       return 'DENSITY_TRANSITION_SPLITTER';
     }
-    if (sig.internalVLineCount >= 3 || (tableRectCount >= 4 && !sig.hasEmbeddedSubGrid && sig.internalVLineCount >= 1)) {
-      return 'PLANAR_GRID_SOLVER';
-    }
     if (sig.hasEmbeddedSubGrid) {
       return 'KEY_VALUE_SUBGRID_FLATTENER';
+    }
+    if (sig.internalVLineCount >= 3 || (tableRectCount >= 4 && sig.internalVLineCount >= 1)) {
+      return 'PLANAR_GRID_SOLVER';
     }
     if (sig.operatorColumnCount >= 1) {
       return 'HLINE_OPERATOR_EQUATION_SOLVER';
     }
     return 'INDENTATION_CLAUSE_SOLVER';
+  }
+
+  private filterNonInsetGridRects(
+    rectItems: PositionedItem[],
+    vLines: PositionedItem[]
+  ): PositionedItem[] {
+    if (rectItems.length === 0) return rectItems;
+    const borderedRects = rectItems.filter((rc) => Boolean(rc.region.style.borderColor));
+    return rectItems.filter((rc) => {
+      if (rc.region.style.borderColor) return true;
+      const enclosingOuter = rectItems.some(
+        (other) =>
+          other !== rc &&
+          other.x <= rc.x - ptToIn(1.5) &&
+          other.x + other.width >= rc.x + rc.width + ptToIn(1.5) &&
+          Math.min(other.y + other.height, rc.y + rc.height) - Math.max(other.y, rc.y) >= rc.height * 0.6
+      );
+      if (enclosingOuter) return false;
+
+      // If VLines or bordered rects exist in this Y-band and don't align with rc edges, rc is an inset text-padding fill
+      const localVLines = vLines.filter(
+        (v) => v.width <= ptToIn(3.5) && v.y + v.height >= rc.y - ptToIn(2) && v.y <= rc.y + rc.height + ptToIn(2)
+      );
+      if (localVLines.length >= 2) {
+        const leftMatches = localVLines.some((v) => Math.abs(v.x - rc.x) <= ptToIn(2.5));
+        const rightMatches = localVLines.some((v) => Math.abs(v.x - (rc.x + rc.width)) <= ptToIn(2.5));
+        if (!leftMatches && !rightMatches) return false;
+      } else if (borderedRects.length >= 2) {
+        const sameBandBordered = borderedRects.some(
+          (b) => Math.min(b.y + b.height, rc.y + rc.height) - Math.max(b.y, rc.y) >= rc.height * 0.6
+        );
+        if (sameBandBordered) return false;
+      }
+      return true;
+    });
+  }
+
+  private mergeJustifiedSameLineWords(
+    contentItems: PositionedItem[],
+    tableRects: PositionedItem[],
+    lineItems: PositionedItem[],
+    weights: CompilerWeights
+  ): PositionedItem[] {
+    const textItems = contentItems.filter((it) => it.kind === 'text');
+    const nonText = contentItems.filter((it) => it.kind !== 'text');
+    if (textItems.length < 2) return contentItems;
+
+    const vLines = lineItems.filter((ln) => ln.width <= ptToIn(3.5) && ln.height >= ptToIn(10));
+    const effectiveRects = this.filterNonInsetGridRects(tableRects, vLines);
+    const rowBuckets = this.clusterItemsIntoRows(textItems, effectiveRects, weights);
+
+    // Track x0 starts that recur across >= 2 rows (true table/operator columns must never be merged across)
+    const allRowStarts = rowBuckets.flatMap((rb) => rb.items.map((it) => it.x));
+    const hasRecurringColumnAnchor = (x0: number): boolean =>
+      allRowStarts.filter((sx) => Math.abs(sx - x0) <= ptToIn(3.0)).length >= 2;
+
+    const mergedTexts: PositionedItem[] = [];
+    for (const rb of rowBuckets) {
+      const sorted = [...rb.items].sort((a, b) => a.x - b.x);
+      if (sorted.length <= 1) {
+        mergedTexts.push(...sorted);
+        continue;
+      }
+      let cur = sorted[0];
+      for (let i = 1; i < sorted.length; i++) {
+        const nxt = sorted[i];
+        const curTxt = (cur.region.text ?? '').trim();
+        const nxtTxt = (nxt.region.text ?? '').trim();
+        const gap = nxt.x - (cur.x + cur.width);
+        const sameStyle =
+          Boolean(cur.region.style.bold) === Boolean(nxt.region.style.bold) &&
+          Boolean(cur.region.style.italic) === Boolean(nxt.region.style.italic) &&
+          Math.abs((cur.region.style.fontSizePt || 8.5) - (nxt.region.style.fontSizePt || 8.5)) <= 1.0 &&
+          (cur.region.style.color ?? '').toUpperCase() === (nxt.region.style.color ?? '').toUpperCase();
+        const crossesVLine = vLines.some(
+          (v) =>
+            v.x >= cur.x + cur.width - ptToIn(1) &&
+            v.x <= nxt.x + ptToIn(1) &&
+            v.y - ptToIn(2) <= cur.y + cur.height / 2 &&
+            cur.y + cur.height / 2 <= v.y + v.height + ptToIn(2)
+        );
+        const crossesRectWall = effectiveRects.some(
+          (rc) =>
+            rc.y - ptToIn(2) <= cur.y + cur.height / 2 &&
+            cur.y + cur.height / 2 <= rc.y + rc.height + ptToIn(2) &&
+            ((rc.x >= cur.x + cur.width - ptToIn(1) && rc.x <= nxt.x + ptToIn(1)) ||
+              (rc.x + rc.width >= cur.x + cur.width - ptToIn(1) && rc.x + rc.width <= nxt.x + ptToIn(1)))
+        );
+        const nxtIsOpOrMarker =
+          /^[:=]$/.test(nxtTxt) ||
+          /^([:=])\s+/.test(nxtTxt) ||
+          STANDALONE_MARKER_RE.test(curTxt) ||
+          STANDALONE_MARKER_RE.test(nxtTxt);
+        const nxtAnchoredColumn = hasRecurringColumnAnchor(nxt.x);
+
+        if (
+          sameStyle &&
+          !crossesVLine &&
+          !crossesRectWall &&
+          !nxtIsOpOrMarker &&
+          !nxtAnchoredColumn &&
+          gap >= -ptToIn(1) &&
+          gap <= ptToIn(34)
+        ) {
+          const combinedTxt = `${curTxt} ${nxtTxt}`.trim();
+          const newRight = Math.max(cur.x + cur.width, nxt.x + nxt.width);
+          const newBottom = Math.max(cur.y + cur.height, nxt.y + nxt.height);
+          cur = {
+            ...cur,
+            width: newRight - cur.x,
+            height: newBottom - cur.y,
+            region: {
+              ...cur.region,
+              width: newRight - cur.x,
+              height: newBottom - cur.y,
+              text: combinedTxt,
+              runs: undefined,
+            },
+          };
+        } else {
+          mergedTexts.push(cur);
+          cur = nxt;
+        }
+      }
+      mergedTexts.push(cur);
+    }
+
+    return [...mergedTexts, ...nonText];
   }
 
   private splitOperatorAlignedTokens(
@@ -3725,11 +3944,16 @@ export class Flat2008TablixCompiler {
         continue;
       }
       const [, lhs, op, rhs] = m;
+      const fs = Math.max(6.5, it.region.style.fontSizePt || 8.5);
       const totalLen = Math.max(1, txt.length);
-      const ratio = (lhs.length + 0.5) / totalLen;
-      const estOpX = it.x + it.width * ratio;
-      const matchedOpX = alignedOpXs.find((ax) => Math.abs(ax - estOpX) <= ptToIn(4.5));
-      if (matchedOpX === undefined || matchedOpX <= it.x + ptToIn(8)) {
+      const proportionalX = it.x + it.width * ((lhs.length + 0.5) / totalLen);
+      const fontBasedX = it.x + ptToIn(lhs.length * fs * 0.52 + 4);
+      const estOpX = Math.min(it.x + it.width * 0.55, Math.max(proportionalX, fontBasedX));
+      const snapTolIn = Math.max(ptToIn(28), ptToIn(lhs.length * fs * 0.72));
+      const matchedOpX = [...alignedOpXs]
+        .filter((ax) => ax > it.x + ptToIn(8) && (Math.abs(ax - estOpX) <= snapTolIn || Math.abs(ax - proportionalX) <= snapTolIn))
+        .sort((a, b) => Math.abs(a - estOpX) - Math.abs(b - estOpX))[0];
+      if (matchedOpX === undefined) {
         out.push(it);
         continue;
       }
@@ -4582,6 +4806,137 @@ export class Flat2008TablixCompiler {
         }
       }
 
+      if (!merged && lastState && !lastState.row.isHeaderRow && curRow.items.length >= 1) {
+        const accRow = lastState.row;
+        const accHasColonOrMulti =
+          accRow.items.length >= 2 ||
+          accRow.items.some((it) => /^[:=]$/.test((it.region.text ?? '').trim()));
+        const curHasNewKvOrMarker = curRow.items.some((it) => {
+          const t = (it.region.text ?? '').trim();
+          return (
+            /^[:=]$/.test(t) ||
+            /^([:=])\s+/.test(t) ||
+            CLAUSE_TITLE_WITH_MARKER_RE.test(t) ||
+            STANDALONE_MARKER_RE.test(t)
+          );
+        });
+        const allItemsText = curRow.items.every((it) => it.kind === 'text' && (it.region.text ?? '').trim().length > 0);
+        const insideBorderedRect = curRow.items.some((it) => {
+          const rc = findEnclosingRect(it);
+          return Boolean(rc?.region.style.borderColor);
+        });
+
+        if (accHasColonOrMulti && !curHasNewKvOrMarker && allItemsText && !insideBorderedRect) {
+          const dyBaseline = curRow.yTop - lastState.lastLineY;
+          const dyGap = curRow.yTop - lastState.lastLineBottom;
+          const refItem = accRow.items.find((it) => it.kind === 'text');
+          const refFs = Math.max(6.5, refItem?.region.style.fontSizePt || 8.5);
+          const validKvLeading =
+            dyBaseline > 0 &&
+            dyBaseline <= ptToIn(refFs * leadRatio) &&
+            dyGap <= ptToIn(refFs * gapRatio);
+
+          const clearBetween = !hasSeparatorBetween(
+            lastState.lastLineBottom,
+            curRow.yTop,
+            Math.min(...accRow.items.map((it) => it.x), ...curRow.items.map((it) => it.x)),
+            Math.max(...accRow.items.map((it) => it.x + it.width), ...curRow.items.map((it) => it.x + it.width)),
+            lastState.lastRectId
+          );
+
+          const matchedPairs: Array<{ accItem: PositionedItem; curItem: PositionedItem }> = [];
+          let allMatched = validKvLeading && clearBetween;
+          if (allMatched) {
+            for (const curItem of curRow.items) {
+              const cand = accRow.items.find((ai) => {
+                if (ai.kind !== 'text') return false;
+                const aTxt = (ai.region.text ?? '').trim();
+                if (/^[:=]$/.test(aTxt) || STANDALONE_MARKER_RE.test(aTxt)) return false;
+                const aRect = findEnclosingRect(ai);
+                const cRect = findEnclosingRect(curItem);
+                if ((aRect?.region.id ?? undefined) !== (cRect?.region.id ?? undefined)) return false;
+                const aBold = isAllBold(ai);
+                const cBold = isAllBold(curItem);
+                const aFs = Math.max(6.5, ai.region.style.fontSizePt || 8.5);
+                const cFs = Math.max(6.5, curItem.region.style.fontSizePt || 8.5);
+                if (aBold !== cBold || ai.region.style.italic !== curItem.region.style.italic || Math.abs(aFs - cFs) > 1.2) {
+                  return false;
+                }
+                const colTol = ptToIn(Math.max(4.5, weights.xClusterTolPt));
+                return Math.abs(ai.x - curItem.x) <= colTol;
+              });
+              if (!cand) {
+                allMatched = false;
+                break;
+              }
+              matchedPairs.push({ accItem: cand, curItem });
+            }
+          }
+
+          if (allMatched && matchedPairs.length > 0) {
+            for (const { accItem, curItem } of matchedPairs) {
+              const prevTxt = (accItem.region.text ?? '').trim();
+              const curTxt = (curItem.region.text ?? '').trim();
+              const joinChar = /:$/.test(prevTxt) ? '\n' : ' ';
+              const joined = joinChar === '\n'
+                ? `${prevTxt}\n${curTxt}`
+                : `${prevTxt} ${curTxt}`.replace(/\s+/g, ' ').trim();
+              const accRuns: VisualTextRun[] =
+                accItem.region.runs && accItem.region.runs.length > 0
+                  ? accItem.region.runs.map((r) => ({ ...r }))
+                  : [
+                      {
+                        text: prevTxt,
+                        fontFamily: accItem.region.style.fontFamily,
+                        fontSizePt: accItem.region.style.fontSizePt,
+                        bold: accItem.region.style.bold,
+                        italic: accItem.region.style.italic,
+                        underline: accItem.region.style.underline,
+                        color: accItem.region.style.color,
+                      },
+                    ];
+              const curRuns: VisualTextRun[] =
+                curItem.region.runs && curItem.region.runs.length > 0
+                  ? curItem.region.runs.map((r) => ({ ...r }))
+                  : [
+                      {
+                        text: curTxt,
+                        fontFamily: curItem.region.style.fontFamily,
+                        fontSizePt: curItem.region.style.fontSizePt,
+                        bold: curItem.region.style.bold,
+                        italic: curItem.region.style.italic,
+                        underline: curItem.region.style.underline,
+                        color: curItem.region.style.color,
+                      },
+                    ];
+              if (accRuns.length > 0 && curRuns.length > 0) {
+                accRuns.push({ ...accRuns[accRuns.length - 1], text: joinChar });
+                accRuns.push(...curRuns);
+              }
+              const newX = Math.min(accItem.x, curItem.x);
+              const newRight = Math.max(accItem.x + accItem.width, curItem.x + curItem.width);
+              const newBottom = Math.max(accItem.y + accItem.height, curItem.y + curItem.height);
+              accItem.x = newX;
+              accItem.width = newRight - newX;
+              accItem.height = newBottom - accItem.y;
+              accItem.region = {
+                ...accItem.region,
+                x: Math.min(accItem.region.x, curItem.region.x),
+                width: newRight - newX,
+                height: newBottom - accItem.y,
+                text: joined,
+                runs: accRuns,
+              };
+            }
+            accRow.yBottom = Math.max(accRow.yBottom, curRow.yBottom);
+            lastState.lastLineY = curRow.yTop;
+            lastState.lastLineBottom = curRow.yBottom;
+            lastState.lineCount++;
+            merged = true;
+          }
+        }
+      }
+
       if (!merged) {
         const clonedRow: LogicalRowBucket = {
           ...curRow,
@@ -4959,44 +5314,50 @@ export class Flat2008TablixCompiler {
     contentSpanY: number,
     weights: CompilerWeights = DEFAULT_COMPILER_WEIGHTS
   ): LogicalRowBucket[] {
-    if (rows.length < 2 || tableRects.length < 2) return rows;
+    const allVLines = lineItems.filter((ln) => ln.width <= ptToIn(3.5) && ln.height >= ptToIn(10));
+    const effectiveRects = this.filterNonInsetGridRects(tableRects, allVLines);
+    if (rows.length < 2 || (effectiveRects.length < 2 && allVLines.length < 2)) return rows;
 
-    const sortedRects = [...tableRects].sort((a, b) => a.y - b.y);
-    const zones: Array<{ yTop: number; yBottom: number; rects: PositionedItem[] }> = [];
-    for (const rc of sortedRects) {
+    const sortedElems = [...effectiveRects, ...allVLines].sort((a, b) => a.y - b.y);
+    const zones: Array<{ yTop: number; yBottom: number; rects: PositionedItem[]; vLines: PositionedItem[] }> = [];
+    for (const el of sortedElems) {
       const last = zones[zones.length - 1];
-      if (last && rc.y <= last.yBottom + ptToIn(6)) {
-        last.yBottom = Math.max(last.yBottom, rc.y + rc.height);
-        last.rects.push(rc);
+      if (last && el.y <= last.yBottom + ptToIn(6)) {
+        last.yBottom = Math.max(last.yBottom, el.y + el.height);
+        if (el.kind === 'rect') last.rects.push(el);
+        else last.vLines.push(el);
       } else {
-        zones.push({ yTop: rc.y, yBottom: rc.y + rc.height, rects: [rc] });
+        zones.push({
+          yTop: el.y,
+          yBottom: el.y + el.height,
+          rects: el.kind === 'rect' ? [el] : [],
+          vLines: el.kind === 'line' ? [el] : [],
+        });
       }
     }
 
     const validZones = zones.filter((z) => {
-      if (z.rects.length < 2) return false;
-      if (contentSpanY > 0 && z.yBottom - z.yTop >= contentSpanY * 0.65) return false;
+      if (z.rects.length + z.vLines.length < 2) return false;
+      if (contentSpanY > 0 && z.yBottom - z.yTop >= contentSpanY * 0.72) return false;
       const xs = clusterValues(
-        z.rects.flatMap((r) => [clamp(r.x, 0, blockW), clamp(r.x + r.width, 0, blockW)]),
+        [
+          ...z.rects.flatMap((r) => [clamp(r.x, 0, blockW), clamp(r.x + r.width, 0, blockW)]),
+          ...z.vLines.map((v) => clamp(v.x, 0, blockW)),
+        ],
         ptToIn(2.5)
       );
-      const ys = clusterValues(z.rects.flatMap((r) => [r.y, r.y + r.height]), ptToIn(weights.yRowClusterTolPt));
-      return xs.length >= 3 && ys.length >= 2;
+      return xs.length >= 3;
     });
     if (validZones.length === 0) return rows;
 
     let currentRows = rows;
     for (const zone of validZones) {
-      const zVLines = lineItems.filter(
-        (ln) =>
-          ln.width <= ptToIn(3) &&
-          ln.height >= ptToIn(10) &&
-          ln.y + ln.height >= zone.yTop - ptToIn(4) &&
-          ln.y <= zone.yBottom + ptToIn(4)
+      const zVLines = allVLines.filter(
+        (ln) => ln.y + ln.height >= zone.yTop - ptToIn(4) && ln.y <= zone.yBottom + ptToIn(4)
       );
       const zHLines = lineItems.filter(
         (ln) =>
-          ln.height <= ptToIn(3) &&
+          ln.height <= ptToIn(3.5) &&
           ln.width >= ptToIn(20) &&
           ln.y >= zone.yTop - ptToIn(4) &&
           ln.y <= zone.yBottom + ptToIn(4)
@@ -5014,6 +5375,7 @@ export class Flat2008TablixCompiler {
       );
       if (subGridXs.length < 3 || subGridYs.length < 2) continue;
 
+      const zoneLeft = subGridXs[0];
       const before: LogicalRowBucket[] = [];
       const insideItems: PositionedItem[] = [];
       const after: LogicalRowBucket[] = [];
@@ -5031,12 +5393,39 @@ export class Flat2008TablixCompiler {
 
       if (insideItems.length === 0) continue;
       const expandedInside = this.expandMultilineItems(insideItems);
+      // Separate KV labels/operators strictly to the left of the sub-grid so they don't fold into subGridXs[0]
+      const leftOfSubGrid = expandedInside.filter((it) => it.x + it.width <= zoneLeft + ptToIn(2));
+      const inSubGrid = expandedInside.filter((it) => it.x + it.width > zoneLeft + ptToIn(2));
+
+      const leftLabelBuckets: PositionedItem[] = [];
+      if (leftOfSubGrid.length > 0) {
+        const leftByX = new Map<number, PositionedItem[]>();
+        const leftXs = clusterValues(leftOfSubGrid.map((it) => it.x), ptToIn(4.0));
+        for (const it of leftOfSubGrid) {
+          let bestLx = leftXs[0];
+          let bestDist = Infinity;
+          for (const lx of leftXs) {
+            const d = Math.abs(it.x - lx);
+            if (d < bestDist) {
+              bestDist = d;
+              bestLx = lx;
+            }
+          }
+          const arr = leftByX.get(bestLx) ?? [];
+          arr.push(it);
+          leftByX.set(bestLx, arr);
+        }
+        for (const [, list] of Array.from(leftByX.entries()).sort((a, b) => a[0] - b[0])) {
+          leftLabelBuckets.push(this.mergeCellBucketItems(list));
+        }
+      }
+
       const subRows: LogicalRowBucket[] = [];
       for (let k = 0; k < subGridYs.length - 1; k++) {
         const yA = subGridYs[k];
         const yB = subGridYs[k + 1];
         if (yB - yA < ptToIn(4)) continue;
-        const rowItems = expandedInside.filter((it) => {
+        const rowItems = inSubGrid.filter((it) => {
           const cy = it.y + it.height / 2;
           return cy >= yA - ptToIn(2) && cy <= yB + ptToIn(2);
         });
@@ -5069,10 +5458,11 @@ export class Flat2008TablixCompiler {
         const rowRects = zone.rects.filter(
           (rc) => midY >= rc.y - ptToIn(2) && midY <= rc.y + rc.height + ptToIn(2)
         );
+        const rowCellItems = k === 0 && leftLabelBuckets.length > 0 ? [...leftLabelBuckets, ...mergedCells] : mergedCells;
         subRows.push({
           yTop: yA,
           yBottom: yB,
-          items: mergedCells,
+          items: rowCellItems,
           rects: rowRects,
           isHeaderRow: k === 0 && (mergedCells.every((it) => it.region.style.bold) || rowRects.some((rc) => Boolean(rc.region.style.backgroundColor))),
           isSubTableRow: true,
@@ -5115,8 +5505,11 @@ export class Flat2008TablixCompiler {
       );
     };
 
-    // Add edges from structural cell rects (excluding full-width outer background rects and forbidden split boxes)
-    for (const rc of rectItems) {
+    const vLines = lineItems.filter((ln) => ln.width <= ptToIn(3.5) && ln.height >= ptToIn(8));
+    const effectiveRects = this.filterNonInsetGridRects(rectItems, vLines);
+
+    // Add edges from structural non-inset cell rects (excluding full-width outer background rects and forbidden split boxes)
+    for (const rc of effectiveRects) {
       if (rc.width < blockW * 0.94 && rc.height <= ptToIn(120)) {
         const rx0 = clamp(rc.x, 0, blockW);
         const rx1 = clamp(rc.x + rc.width, 0, blockW);
@@ -5126,12 +5519,10 @@ export class Flat2008TablixCompiler {
     }
 
     // Add edges from vertical vector separator lines
-    for (const ln of lineItems) {
-      if (ln.width <= ptToIn(3) && ln.height >= ptToIn(8)) {
-        const lx = clamp(ln.x, 0, blockW);
-        if (!isForbiddenColX(lx, ln.y)) {
-          rawEdges.push(lx);
-        }
+    for (const ln of vLines) {
+      const lx = clamp(ln.x, 0, blockW);
+      if (!isForbiddenColX(lx, ln.y)) {
+        rawEdges.push(lx);
       }
     }
 
@@ -5213,6 +5604,36 @@ export class Flat2008TablixCompiler {
       }
     }
     cleaned.push(blockW);
+
+    // Prune empty leading margin ghost column (when zero items/vlines/bordered-walls start before cleaned[1] - 2pt)
+    if (cleaned.length >= 3) {
+      const b1 = cleaned[1];
+      const hasLeftContent =
+        rows.some((r) => r.items.some((it) => it.x < b1 - ptToIn(2))) ||
+        vLines.some((v) => v.x < b1 - ptToIn(2)) ||
+        effectiveRects.some((rc) => Boolean(rc.region.style.borderColor) && rc.width < blockW * 0.9 && rc.x < b1 - ptToIn(2));
+      const hasVWallAtB1 =
+        vLines.some((v) => Math.abs(v.x - b1) <= ptToIn(2.5)) ||
+        effectiveRects.some((rc) => rc.region.style.borderColor && Math.abs(rc.x - b1) <= ptToIn(2.5));
+      if (!hasLeftContent && !hasVWallAtB1 && b1 <= ptToIn(24)) {
+        cleaned.splice(1, 1);
+      }
+    }
+    // Prune trailing empty margin ghost column only if no vector wall sits at bLast
+    if (cleaned.length >= 3) {
+      const bLast = cleaned[cleaned.length - 2];
+      const hasRightContent =
+        rows.some((r) => r.items.some((it) => it.x + it.width > bLast + ptToIn(2))) ||
+        vLines.some((v) => v.x > bLast + ptToIn(2));
+      const hasVWallAtLast =
+        vLines.some((v) => Math.abs(v.x - bLast) <= ptToIn(2.5)) ||
+        effectiveRects.some(
+          (rc) => rc.region.style.borderColor && Math.abs(rc.x + rc.width - bLast) <= ptToIn(2.5)
+        );
+      if (!hasRightContent && !hasVWallAtLast && blockW - bLast <= ptToIn(14)) {
+        cleaned.splice(cleaned.length - 2, 1);
+      }
+    }
 
     const hasDenseTable = rows.filter((r) => r.items.length >= 4).length >= 3;
     if (!hasDenseTable && cleaned.length === 2 && rows.some((r) => r.items.length >= 2)) {
@@ -5451,6 +5872,132 @@ export class Flat2008TablixCompiler {
         (c) => !c.skipBecauseMerged && c.content.kind === 'Textbox' && c.content.value.trim().length > 0
       );
 
+      if (nonEmpty2.length === 0 || nonEmpty1.length === 0) {
+        i++;
+        continue;
+      }
+
+      // Multi-column KV Label/Value continuation merge ([R-COLON-GRID] + [R-ROW-BOLD-MERGE])
+      const r2HasNewOpOrMarker = nonEmpty2.some((c) => {
+        if (c.content.kind !== 'Textbox') return true;
+        const v = c.content.value.trim();
+        return /^[:=]$/.test(v) || /^([:=])\s+/.test(v) || CLAUSE_TITLE_WITH_MARKER_RE.test(v) || STANDALONE_MARKER_RE.test(v);
+      });
+      if (!r2HasNewOpOrMarker) {
+        const dyGap = lr2.yTop - lr1.yBottom;
+        const dyBaseline = lr2.yTop - lr1.yTop;
+        const pairs: Array<{ c1: TablixCell; c2: TablixCell }> = [];
+        let canPairAll = true;
+        for (const c2 of nonEmpty2) {
+          if (c2.content.kind !== 'Textbox') {
+            canPairAll = false;
+            break;
+          }
+          const tb2 = c2.content;
+          const val2 = tb2.value.trim();
+          const c1Match = nonEmpty1.find((c1) => {
+            if (c1.content.kind !== 'Textbox') return false;
+            const tb1 = c1.content;
+            const val1 = tb1.value.trim();
+            if (!val1 || /^[:=]$/.test(val1) || STANDALONE_MARKER_RE.test(val1)) return false;
+            if (tb1.style.bold || tb2.style.bold || tb1.style.italic !== tb2.style.italic) return false;
+            const fs1 = Math.max(6.5, tb1.style.fontSizePt || 8.5);
+            const fs2 = Math.max(6.5, tb2.style.fontSizePt || 8.5);
+            if (Math.abs(fs1 - fs2) > 1.0) return false;
+            if ((tb1.style.color ?? '').toUpperCase() !== (tb2.style.color ?? '').toUpperCase()) return false;
+            if ((tb1.style.backgroundColor ?? '') !== (tb2.style.backgroundColor ?? '')) return false;
+            if (tb1.style.borderColor || tb2.style.borderColor || tb1.style.borderEdges || tb2.style.borderEdges) return false;
+            const maxBasePt = fs1 * (relaxedLeading ? 2.1 : 1.65);
+            if (dyGap > ptToIn(fs1 * (relaxedLeading ? 1.25 : 0.95)) || dyBaseline > ptToIn(maxBasePt)) return false;
+            const sameCol = c1.colIndex === c2.colIndex;
+            const sameX0 =
+              tb1.sourceX0In !== undefined &&
+              tb2.sourceX0In !== undefined &&
+              Math.abs(inToPt(tb1.sourceX0In - tb2.sourceX0In)) <= 4.5;
+            return sameCol || sameX0;
+          });
+          if (!c1Match || !val2) {
+            canPairAll = false;
+            break;
+          }
+          pairs.push({ c1: c1Match, c2 });
+        }
+
+        const spanX1 = Math.min(...lr1.items.map((it) => it.x), ...lr2.items.map((it) => it.x));
+        const spanX2 = Math.max(...lr1.items.map((it) => it.x + it.width), ...lr2.items.map((it) => it.x + it.width));
+        if (canPairAll && pairs.length > 0 && !hasPhysicalDividerBetween(lr1.yBottom, lr2.yTop, spanX1, spanX2)) {
+          for (const { c1, c2 } of pairs) {
+            if (c1.content.kind !== 'Textbox' || c2.content.kind !== 'Textbox') continue;
+            const tb1 = c1.content;
+            const tb2 = c2.content;
+            const val1 = tb1.value.trim();
+            const val2 = tb2.value.trim();
+            const joinChar = /:$/.test(val1) ? '\n' : ' ';
+            tb1.value = joinChar === '\n' ? `${val1}\n${val2}` : `${val1} ${val2}`.replace(/\s+/g, ' ').trim();
+            const runs1 = tb1.runs ? [...tb1.runs] : [];
+            const runs2 = tb2.runs ? [...tb2.runs] : [];
+            if (runs1.length > 0 && runs2.length > 0) {
+              runs1.push({ ...runs1[runs1.length - 1], text: joinChar });
+              tb1.runs = [...runs1, ...runs2];
+            }
+            tb1.sourceLineCount = (tb1.sourceLineCount ?? 1) + (tb2.sourceLineCount ?? 1);
+            if (tb2.sourceYMaxPt !== undefined) {
+              tb1.sourceYMaxPt = Math.max(tb1.sourceYMaxPt ?? tb2.sourceYMaxPt, tb2.sourceYMaxPt);
+            }
+            const c1End = c1.colIndex + c1.colSpan - 1;
+            const c2End = c2.colIndex + c2.colSpan - 1;
+            if (c1.colIndex <= c2.colIndex && c2End > c1End) {
+              let canExtend = true;
+              for (let cc = c1End + 1; cc <= c2End; cc++) {
+                const trailCell = r1.cells[cc];
+                if (
+                  !trailCell ||
+                  trailCell.skipBecauseMerged ||
+                  (trailCell.content.kind === 'Textbox' && trailCell.content.value.trim().length > 0) ||
+                  trailCell.content.kind === 'Image' ||
+                  trailCell.content.kind === 'Tablix'
+                ) {
+                  canExtend = false;
+                  break;
+                }
+              }
+              if (canExtend) {
+                c1.colSpan = c2End - c1.colIndex + 1;
+                for (let cc = c1End + 1; cc <= c2End; cc++) {
+                  r1.cells[cc] = {
+                    colIndex: cc,
+                    rowIndex: r1.cells[cc].rowIndex,
+                    colSpan: 1,
+                    rowSpan: 1,
+                    skipBecauseMerged: true,
+                    content: { kind: 'Empty', name: `Merged_${r1.cells[cc].rowIndex}_${cc}` },
+                  };
+                }
+              }
+            }
+          }
+
+          const rowHeightInputs = r1.cells
+            .filter((cell) => !cell.skipBecauseMerged && cell.content.kind === 'Textbox')
+            .map((cell) => {
+              const ct = cell.content as Extract<typeof cell.content, { kind: 'Textbox' }>;
+              const cw = inToPt(
+                columnWidthsIn
+                  .slice(cell.colIndex, Math.min(columnWidthsIn.length, cell.colIndex + cell.colSpan))
+                  .reduce((s, w) => s + w, 0)
+              );
+              return { text: ct.value, runs: ct.runs, style: ct.style, coveredWidthPt: cw };
+            });
+          r1.heightIn = roundIn(ptToIn(estimateWrappedRowHeightPt(rowHeightInputs, minRowHeightPt, weights)));
+          lr1.yBottom = Math.max(lr1.yBottom, lr2.yBottom);
+          lr1.items = [...lr1.items, ...lr2.items];
+          tablixRows.splice(i + 1, 1);
+          emittedLogicalRows.splice(lrIdx2, 1);
+          anyMerged = true;
+          continue;
+        }
+      }
+
       if (nonEmpty2.length !== 1 || nonEmpty1.length === 0 || nonEmpty1.length > 2) {
         i++;
         continue;
@@ -5475,7 +6022,7 @@ export class Flat2008TablixCompiler {
       const tb2 = c2.content;
       const val1 = tb1.value.trim();
       const val2 = tb2.value.trim();
-      if (!val1 || !val2 || /:$/.test(val1)) {
+      if (!val1 || !val2 || /:$/.test(val1) || STANDALONE_MARKER_RE.test(val1)) {
         i++;
         continue;
       }

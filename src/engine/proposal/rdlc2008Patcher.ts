@@ -65,8 +65,6 @@ export class Rdlc2008Patcher {
   </Body>
   <Width>7.7in</Width>
   <Page><PageHeight>11in</PageHeight><PageWidth>8.5in</PageWidth><LeftMargin>0.4in</LeftMargin><RightMargin>0.4in</RightMargin><TopMargin>0.4in</TopMargin><BottomMargin>0.4in</BottomMargin><Style /></Page>
-  <ReportParameters>
-  </ReportParameters>
   <rd:ReportUnitType>Inch</rd:ReportUnitType>
 </Report>
 `;
@@ -103,6 +101,21 @@ export class Rdlc2008Patcher {
         .replace(/<\/ReportSection>\s*<\/ReportSections>/i, '');
     }
 
+    // Strict RDLC 2008 forbids <ReportParametersLayout> and <ReportParameters>
+    xml = xml
+      .replace(/<ReportParametersLayout>[\s\S]*?<\/ReportParametersLayout>\s*/gi, '')
+      .replace(/<ReportParameters>[\s\S]*?<\/ReportParameters>\s*/gi, '');
+
+    // Strict RDLC 2008 Tablix/Textbox hardening: ensure <CanShrink>false</CanShrink> and Tablix <Style />
+    xml = xml.replace(
+      /(<CanGrow>true<\/CanGrow>)(\s*)(?!<CanShrink>)/gi,
+      '$1$2<CanShrink>false</CanShrink>$2'
+    );
+    xml = xml.replace(
+      /(<Width>[^<]+<\/Width>)(\s*)(<\/Tablix>)/gi,
+      '$1$2  <Style />$2$3'
+    );
+
     diffItems.push({
       fileName: targetFileName,
       symbolName: targetFileName,
@@ -111,7 +124,7 @@ export class Rdlc2008Patcher {
       reason: `Cloned benchmark RDLC 2008 XML and rebound DataSet "${definition.dataSetName}" preserving Tablix layout.`,
     });
 
-    // Audit preserved Tablix blocks & existing ReportParameters from benchmark
+    // Audit preserved Tablix blocks from benchmark
     for (const match of xml.matchAll(/<Tablix\s+Name="([^"]+)"/gi)) {
       const tName = match[1];
       const wasRenamed = bench !== prod && tName.includes(prod);
@@ -123,16 +136,6 @@ export class Rdlc2008Patcher {
         reason: wasRenamed
           ? 'Preserved benchmark Tablix layout with updated product identifier.'
           : 'Preserved benchmark Tablix layout verbatim.',
-      });
-    }
-
-    for (const match of xml.matchAll(/<ReportParameter\s+Name="([^"]+)"/gi)) {
-      diffItems.push({
-        fileName: targetFileName,
-        symbolName: match[1],
-        symbolKind: 'Parameter',
-        status: 'UNCHANGED',
-        reason: 'Reused existing benchmark ReportParameter.',
       });
     }
 
@@ -167,32 +170,7 @@ export class Rdlc2008Patcher {
       xml = xml.replace('</Fields>', `${addedFields.join('\n')}\n      </Fields>`);
     }
 
-    // 3. Patch only missing <ReportParameter> entries into <ReportParameters>
-    const addedParams: string[] = [];
-    for (const param of definition.parameters) {
-      const paramPattern = new RegExp(`<ReportParameter\\s+Name="${escapeRegExp(param.name)}"`, 'i');
-      if (!paramPattern.test(xml)) {
-        addedParams.push(
-          `    <ReportParameter Name="${escapeXml(param.name)}"><DataType>${escapeXml(
-            param.dataType
-          )}</DataType><Nullable>true</Nullable><AllowBlank>true</AllowBlank><Prompt>${escapeXml(
-            param.name
-          )}</Prompt></ReportParameter>`
-        );
-        diffItems.push({
-          fileName: targetFileName,
-          symbolName: param.name,
-          symbolKind: 'Parameter',
-          status: 'ADDED',
-          reason: 'Added missing ReportParameter from ProposalDefinition.',
-        });
-      }
-    }
-    if (addedParams.length > 0 && xml.includes('</ReportParameters>')) {
-      xml = xml.replace('</ReportParameters>', `${addedParams.join('\n')}\n  </ReportParameters>`);
-    }
-
-    // 4. Patch new ADD sections into </ReportItems> as RDLC 2008 Tablix blocks without altering existing Tablix blocks
+    // 3. Patch new ADD sections into </ReportItems> as RDLC 2008 Tablix blocks without altering existing Tablix blocks
     const addSections = definition.sections.filter(
       (s) => s.decision === 'ADD' && s.targetRdlcFile.toLowerCase() === targetFileName.toLowerCase()
     );
@@ -227,6 +205,7 @@ export class Rdlc2008Patcher {
                   <CellContents>
                     <Textbox Name="txtSection_${escapeXml(safeId)}">
                       <CanGrow>true</CanGrow>
+                      <CanShrink>false</CanShrink>
                       <Paragraphs><Paragraph><TextRuns><TextRun><Value>${escapeXml(
                         sec.title
                       )}</Value><Style><FontWeight>Bold</FontWeight></Style></TextRun></TextRuns><Style /></Paragraph></Paragraphs>
@@ -245,6 +224,7 @@ export class Rdlc2008Patcher {
         <Left>0.4in</Left>
         <Height>0.32in</Height>
         <Width>6.8in</Width>
+        <Style />
       </Tablix>`;
         })
         .join('\n');
@@ -255,7 +235,6 @@ export class Rdlc2008Patcher {
 
     this.logger.info('Rdlc2008Patcher', `Minimal-mutation patched ${targetFileName}`, {
       addedFields: addedFields.length,
-      addedParams: addedParams.length,
       addedSections: addSections.length,
     });
 

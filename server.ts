@@ -24,6 +24,7 @@ import { ProjectInserter } from './src/engine/proposal/projectInserter.ts';
 import { ProposalOrchestrator } from './src/engine/proposal/proposalOrchestrator.ts';
 import { sanitizeProductCode, StagingManager } from './src/engine/proposal/stagingManager.ts';
 import { RdlcValidator } from './src/engine/rdlc/rdlcValidator.ts';
+import { defaultVectorArtifactStore, GateStage } from './src/engine/vector/vectorArtifactStore.ts';
 import {
   buildVerificationFixtureExcel,
   buildVerificationFixturePdf,
@@ -1030,6 +1031,122 @@ async function startServer() {
       return res.json({ ok: true, bytes: file.buffer.byteLength, status });
     } catch (err) {
       return res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Assistive Vector Artifact Store ([R-ARCH-01]): similar-layout lookup, regression inspection, diagnostic diffing
+  app.get('/api/vector-store/artifacts', (req, res) => {
+    try {
+      const limitRaw = req.query.limit !== undefined ? Number(req.query.limit) : 50;
+      const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, Math.trunc(limitRaw))) : 50;
+      const documentTemplate =
+        typeof req.query.documentTemplate === 'string' && req.query.documentTemplate.trim().length > 0
+          ? req.query.documentTemplate.trim().slice(0, 160)
+          : undefined;
+      const validStages = new Set<GateStage>([
+        'GATE_1_EXTRACTION',
+        'GATE_2_SEGMENTATION',
+        'GATE_3_SOLVER',
+        'GATE_4_RDLC_XSD',
+        'GATE_5_VALUE_FILL',
+        'GATE_6_PARITY_RENDER',
+      ]);
+      const gateStageRaw = typeof req.query.gateStage === 'string' ? req.query.gateStage.trim() : undefined;
+      const gateStage = gateStageRaw && validStages.has(gateStageRaw as GateStage) ? (gateStageRaw as GateStage) : undefined;
+      const pageIndex =
+        req.query.pageIndex !== undefined && Number.isFinite(Number(req.query.pageIndex))
+          ? Math.trunc(Number(req.query.pageIndex))
+          : undefined;
+
+      const artifacts = defaultVectorArtifactStore.listArtifacts({
+        limit,
+        documentTemplate,
+        gateStage,
+        pageIndex,
+      });
+      return res.json({ ok: true, count: artifacts.length, artifacts });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/vector-store/artifacts', (req, res) => {
+    try {
+      const body = req.body as Record<string, unknown> | undefined;
+      if (!body || typeof body !== 'object' || typeof body.documentTemplate !== 'string' || !body.documentTemplate.trim()) {
+        return res.status(400).json({ error: 'documentTemplate (non-empty string) is required.' });
+      }
+      if (body.pageIndex !== undefined && !Number.isFinite(Number(body.pageIndex))) {
+        return res.status(400).json({ error: 'pageIndex must be a finite number.' });
+      }
+
+      const saved = defaultVectorArtifactStore.recordArtifact({
+        documentTemplate: body.documentTemplate,
+        pageIndex: body.pageIndex !== undefined ? Number(body.pageIndex) : 0,
+        gateStage: (typeof body.gateStage === 'string' ? body.gateStage : 'GATE_4_RDLC_XSD') as GateStage,
+        appliedRules: Array.isArray(body.appliedRules) ? (body.appliedRules as string[]) : [],
+        hasDualTrackStream: Boolean(body.hasDualTrackStream),
+        hasNestedTablix: Boolean(body.hasNestedTablix),
+        hasStaircaseIndent: Boolean(body.hasStaircaseIndent),
+        xsdValidationPassed: Boolean(body.xsdValidationPassed),
+        renderedPageCount: body.renderedPageCount !== undefined ? Number(body.renderedPageCount) : 1,
+        sourcePageCount: body.sourcePageCount !== undefined ? Number(body.sourcePageCount) : 1,
+        features: body.features && typeof body.features === 'object' ? (body.features as Record<string, unknown>) : undefined,
+        customEmbedding: Array.isArray(body.embedding) ? (body.embedding as number[]) : undefined,
+        containers: Array.isArray(body.containers) ? (body.containers as never[]) : undefined,
+        diagnostics: Array.isArray(body.diagnostics) ? (body.diagnostics as string[]) : undefined,
+      });
+      return res.status(201).json({ ok: true, artifact: saved });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/vector-store/search', (req, res) => {
+    try {
+      const body = req.body as Record<string, unknown> | undefined;
+      if (!body || typeof body !== 'object') {
+        return res.status(400).json({ error: 'JSON request body is required.' });
+      }
+      const topK = body.topK !== undefined ? Number(body.topK) : 5;
+      if (!Number.isFinite(topK) || topK < 1 || topK > 50) {
+        return res.status(400).json({ error: 'topK must be between 1 and 50.' });
+      }
+      const results = defaultVectorArtifactStore.searchSimilar({
+        topK,
+        features: body.features && typeof body.features === 'object' ? (body.features as Record<string, unknown>) : undefined,
+        embedding: Array.isArray(body.embedding) ? (body.embedding as number[]) : undefined,
+        documentTemplate: typeof body.documentTemplate === 'string' ? body.documentTemplate : undefined,
+        gateStage: typeof body.gateStage === 'string' ? (body.gateStage as GateStage) : undefined,
+        pageIndex: body.pageIndex !== undefined && Number.isFinite(Number(body.pageIndex)) ? Number(body.pageIndex) : undefined,
+      });
+      return res.json({ ok: true, assistiveOnly: true, results });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/vector-store/diff', (req, res) => {
+    try {
+      const body = req.body as Record<string, unknown> | undefined;
+      if (
+        !body ||
+        typeof body !== 'object' ||
+        typeof body.baselineId !== 'string' ||
+        !body.baselineId.trim() ||
+        typeof body.candidateId !== 'string' ||
+        !body.candidateId.trim()
+      ) {
+        return res.status(400).json({ error: 'baselineId and candidateId are required.' });
+      }
+      const diff = defaultVectorArtifactStore.computeRegressionDiff(body.baselineId, body.candidateId);
+      return res.json({ ok: true, diff });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('not found')) {
+        return res.status(404).json({ error: msg });
+      }
+      return res.status(500).json({ error: msg });
     }
   });
 

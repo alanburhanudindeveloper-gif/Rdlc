@@ -6,7 +6,7 @@ using ReportGen.Compiler.Models;
 namespace ReportGen.Compiler;
 
 /// <summary>
-/// Deterministic PDF-to-RDLC 2008 Compiler (Rules v3.2).
+/// Deterministic PDF-to-RDLC 2008 Compiler (Rules v3.3 — Page 1 &amp; Multi-Stream Patch).
 /// Strictly zero hardcoding: all structure, splits, spans, and borders derive
 /// purely from geometric primitives, fill luminance, typography, and generic markers.
 /// </summary>
@@ -26,15 +26,23 @@ public sealed class RdlcBuilder
     private const double BorderCoverageMin = 0.70;
     private const double ColonClusterTolPt = 2.5;
     private const double StaircaseClusterTolPt = 3.0;
-    private const double BoldMergeXTolPt = 4.0;
+    private const double BoldMergeXTolPt = 4.5;
     private const double LeadingRatioMax = 1.65;
 
     private static readonly Regex MarkerRegex = new(
-        @"^(?:(?:\d+(?:\.\d+)*|[a-zA-Z]|[ivxlcdmIVXLCDM]+)\.|(?:\([0-9a-zA-Z]+\))|[•\u2022\-–*])$",
+        @"^(?:\d+(?:\.\d+)*\.|[a-z]\.|(?:i{1,3}|iv|vi{0,3}|ix|x)\.|(?:\(\d+\)|\([a-z]{1,2}\))|[•\u2022\-–*])$",
         RegexOptions.Compiled);
 
     private static readonly Regex InlineMarkerRegex = new(
-        @"^((?:\d+(?:\.\d+)*|[a-zA-Z]|[ivxlcdmIVXLCDM]+)\.|(?:\([0-9a-zA-Z]+\))|[•\u2022\-–*])\s+(.+)$",
+        @"^(\d+(?:\.\d+)*\.|[a-z]\.|(?:i{1,3}|iv|vi{0,3}|ix|x)\.|(?:\(\d+\)|\([a-z]{1,2}\))|[•\u2022\-–*])\s+(.+)$",
+        RegexOptions.Compiled);
+
+    private static readonly Regex InlineColonRegex = new(
+        @"^(.{2,42}?)\s*([:=])\s+(.+)$",
+        RegexOptions.Compiled);
+
+    private static readonly Regex PrefixColonRegex = new(
+        @"^([:=])\s+(.+)$",
         RegexOptions.Compiled);
 
     private int _nameCounter = 1;
@@ -458,7 +466,7 @@ public sealed class RdlcBuilder
             }
         }
 
-        double bestWidth = 0.0;
+        double bestScore = double.NegativeInfinity;
         double bestCenter = 0.0;
         for (int i = 0; i < merged.Count - 1; i++)
         {
@@ -469,20 +477,48 @@ public sealed class RdlcBuilder
             bool anyCrossing = spans.Any(s => s.X0 < center - 1.5 && s.X1 > center + 1.5);
             if (anyCrossing) continue;
 
-            int leftCount = spans.Count(s => s.CenterX < center);
-            int rightCount = spans.Count(s => s.CenterX >= center);
-            bool hasPairedGridOrKv =
-                (vLines.Count(v => v.X0 < center) >= 2 && vLines.Count(v => v.X0 > center) >= 2) ||
-                (leftCount >= 3 && rightCount >= 3);
+            var leftSpans = spans.Where(s => s.CenterX < center).ToList();
+            var rightSpans = spans.Where(s => s.CenterX >= center).ToList();
+            if (leftSpans.Count < 2 || rightSpans.Count < 2) continue;
 
-            if (hasPairedGridOrKv && gap > bestWidth)
+            // Require genuinely overlapping vertical bands so vertically stacked blocks aren't split horizontally
+            double overlapY = Math.Min(leftSpans.Max(s => s.Y1), rightSpans.Max(s => s.Y1)) -
+                              Math.Max(leftSpans.Min(s => s.Y0), rightSpans.Min(s => s.Y0));
+            if (overlapY <= -10.0) continue;
+
+            int leftV = vLines.Count(v => v.X0 < center);
+            int rightV = vLines.Count(v => v.X0 > center);
+            var leftOps = FindAlignedOperatorXs(leftSpans);
+            var rightOps = FindAlignedOperatorXs(rightSpans);
+
+            bool leftHasLabel = leftOps.Count == 0 || leftSpans.Any(s => s.X1 <= leftOps[0] - 2.0 && !PrefixColonRegex.IsMatch(s.Text.Trim()));
+            bool rightHasLabel = rightOps.Count == 0 || rightSpans.Any(s => s.X1 <= rightOps[0] - 2.0 && !PrefixColonRegex.IsMatch(s.Text.Trim()));
+
+            // Reject intra-KV splits where rightSide begins directly at ':'/'=' with no labels left of ':'
+            if (rightOps.Count >= 1 && !rightHasLabel && !(leftV >= 2 && rightV >= 2))
             {
-                bestWidth = gap;
+                continue;
+            }
+
+            bool hasPairedGridOrKv =
+                (leftV >= 2 && rightV >= 2) ||
+                (leftOps.Count >= 1 && rightOps.Count >= 1 && leftHasLabel && rightHasLabel) ||
+                (leftSpans.Count >= 3 && rightSpans.Count >= 3);
+            if (!hasPairedGridOrKv) continue;
+
+            double bothKvBonus = (leftOps.Count >= 1 && rightOps.Count >= 1 && leftHasLabel && rightHasLabel) ? 60.0 : 0.0;
+            double bothGridBonus = (leftV >= 2 && rightV >= 2) ? 50.0 : 0.0;
+            double centralityPenalty = Math.Abs(center - widthPt / 2.0) * 1.4;
+            double score = gap + bothKvBonus + bothGridBonus + Math.Min(leftSpans.Count, rightSpans.Count) * 3.0 - centralityPenalty;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
                 bestCenter = center;
             }
         }
 
-        if (bestWidth >= MinGutterPt)
+        if (bestScore > double.NegativeInfinity && bestCenter > 0.0)
         {
             gutterXPt = Math.Round(bestCenter, 2);
             return true;
@@ -750,6 +786,21 @@ public sealed class RdlcBuilder
         };
     }
 
+    private static bool HasEmbeddedSubGridZone(
+        List<TextSpan> spans,
+        List<LineSegment> vLines,
+        List<LineSegment> hLines)
+    {
+        if (vLines.Count < 2 || spans.Count < 2) return false;
+        double spanY = spans.Max(s => s.Y1) - spans.Min(s => s.Y0);
+        if (spanY <= 0.0) return false;
+        double minVY = vLines.Min(v => v.Y0);
+        double maxVY = vLines.Max(v => v.Y1);
+        double minVX = vLines.Min(v => v.X0);
+        int outsideCount = spans.Count(s => s.CenterY < minVY - 4.0 || s.CenterY > maxVY + 4.0 || s.X1 < minVX - 4.0);
+        return outsideCount >= 2 || (maxVY - minVY) < spanY * 0.72 || minVX >= 60.0;
+    }
+
     private SolverStrategyKind SelectStrategy(
         List<TextSpan> spans,
         List<LineSegment> hLines,
@@ -759,6 +810,13 @@ public sealed class RdlcBuilder
         bool forceFootnote)
     {
         if (forceFootnote) return SolverStrategyKind.DensityTransitionSplitter;
+
+        // [R-SUBGRID-STACK]: Embedded sub-grids inside KV/dual-track streams route to KeyValueSubGridFlattener BEFORE PlanarGridSolver
+        if (HasEmbeddedSubGridZone(spans, vLines, hLines))
+        {
+            return SolverStrategyKind.KeyValueSubGridFlattener;
+        }
+
         if (vLines.Count >= 3) return SolverStrategyKind.PlanarGridSolver;
 
         // Check for aligned ':' or '=' operators ([R-COLON-GRID])
@@ -820,7 +878,11 @@ public sealed class RdlcBuilder
     {
         var rawXs = new List<double> { 0.0, widthPt };
         rawXs.AddRange(vLines.Select(v => Math.Clamp(v.X0, 0.0, widthPt)));
-        var colBounds = DeduplicateGridBounds(ClusterValues(rawXs, BorderMatchTolPt), 8.0, widthPt);
+        var colBounds = PruneEmptyEdgeGhostColumns(
+            DeduplicateGridBounds(ClusterValues(rawXs, BorderMatchTolPt), 8.0, widthPt),
+            spans,
+            vLines,
+            widthPt);
         int numCols = Math.Max(1, colBounds.Count - 1);
         var colWidths = Enumerable.Range(0, numCols).Select(c => Math.Round(colBounds[c + 1] - colBounds[c], 2)).ToList();
 
@@ -933,13 +995,14 @@ public sealed class RdlcBuilder
         List<FillBox> rowFills,
         double widthPt)
     {
+        var opXs = FindAlignedOperatorXs(spans);
         var yRows = ClusterSpansIntoRows(spans);
         var rawColBounds = new List<double> { 0.0, widthPt };
 
         if (strategy == SolverStrategyKind.HLineOperatorSolver || strategy == SolverStrategyKind.KeyValueSubGridFlattener)
         {
             // [R-COLON-GRID]: Cluster ':' / '=' X positions within 2.5pt -> narrow operator column
-            foreach (var opX in FindAlignedOperatorXs(spans))
+            foreach (var opX in opXs)
             {
                 rawColBounds.Add(Math.Clamp(opX, 8.0, widthPt - 16.0));
                 rawColBounds.Add(Math.Clamp(opX + 9.0, 16.0, widthPt - 8.0));
@@ -972,14 +1035,19 @@ public sealed class RdlcBuilder
         }
 
         rawColBounds.AddRange(vLines.Select(v => Math.Clamp(v.X0, 0.0, widthPt)));
-        var colBounds = DeduplicateGridBounds(ClusterValues(rawColBounds, 2.5), 8.0, widthPt);
+        var colBounds = PruneEmptyEdgeGhostColumns(
+            DeduplicateGridBounds(ClusterValues(rawColBounds, 2.5), 8.0, widthPt),
+            spans,
+            vLines,
+            widthPt);
         int numCols = Math.Max(1, colBounds.Count - 1);
         var colWidths = Enumerable.Range(0, numCols).Select(c => Math.Round(colBounds[c + 1] - colBounds[c], 2)).ToList();
 
         var compiledRows = new List<CompiledRow>();
         foreach (var rowSpans in yRows)
         {
-            var expanded = SplitInlineMarkersAndOperators(rowSpans, strategy);
+            var expanded = SplitInlineMarkersAndOperators(rowSpans, strategy, opXs);
+            if (expanded.Count == 0) continue;
             var primary = expanded[0];
             double y0 = rowSpans.Min(s => s.Y0);
             double y1 = rowSpans.Max(s => s.Y1);
@@ -1078,8 +1146,8 @@ public sealed class RdlcBuilder
     }
 
     /// <summary>
-    /// [R-ROW-BOLD-MERGE]: While convergence loop merging consecutive Regular rows sharing
-    /// column & x0 (|Δx0| <= 4pt, Δy <= 1.65 * fontSize) with no HLine/RowFillBand/marker between.
+    /// [R-ROW-BOLD-MERGE] + [R-COLON-GRID]: Convergent while loop merging consecutive Regular
+    /// prose rows AND multi-column KV Label/Value continuations when no HLine/RowFillBand divider separates them.
     /// </summary>
     private static void ConvergeRegularProseMerge(
         List<CompiledRow> rows,
@@ -1104,40 +1172,60 @@ public sealed class RdlcBuilder
                     continue;
                 }
 
-                var nonEmpty1 = r1.Cells.Where(c => !string.IsNullOrWhiteSpace(c.Text)).ToList();
-                var nonEmpty2 = r2.Cells.Where(c => !string.IsNullOrWhiteSpace(c.Text)).ToList();
-                if (nonEmpty1.Count != 1 || nonEmpty2.Count != 1)
-                {
-                    i++;
-                    continue;
-                }
-
-                var c1 = nonEmpty1[0];
-                var c2 = nonEmpty2[0];
-                if (c1.IsBold || c2.IsBold || c1.ColSpan != c2.ColSpan)
-                {
-                    i++;
-                    continue;
-                }
-
-                if (MarkerRegex.IsMatch(c2.Text.Trim()) || InlineMarkerRegex.IsMatch(c2.Text.Trim()))
-                {
-                    i++;
-                    continue;
-                }
-
                 double dy = r2.SourceY0Pt - r1.SourceY0Pt;
-                double maxLeading = Math.Max(8.5, c1.FontSizePt) * LeadingRatioMax;
-                bool sameX0 = Math.Abs(c1.SourceX0Pt - c2.SourceX0Pt) <= BoldMergeXTolPt;
-                bool validDy = dy > 0 && dy <= maxLeading;
                 bool hasPhysDivider =
                     hLines.Any(h => h.Y0 >= r1.SourceY1Pt - 1.5 && h.Y0 <= r2.SourceY0Pt + 1.5) ||
                     rowFills.Any(rf => Math.Abs(rf.Y0 - r2.SourceY0Pt) <= 2.0 || Math.Abs(rf.Y1 - r1.SourceY1Pt) <= 2.0);
-
-                if (sameX0 && validDy && !hasPhysDivider && (c1.BackgroundHex ?? "") == (c2.BackgroundHex ?? ""))
+                if (dy <= 0 || hasPhysDivider)
                 {
-                    c1.Text = $"{c1.Text.Trim()} {c2.Text.Trim()}";
-                    c1.SourceLineCount += c2.SourceLineCount;
+                    i++;
+                    continue;
+                }
+
+                var map1 = MapCellsByLogicalCol(r1.Cells);
+                var map2 = MapCellsByLogicalCol(r2.Cells);
+                var nonEmpty2 = map2.Where(kv => !string.IsNullOrWhiteSpace(kv.Value.Text)).ToList();
+                if (nonEmpty2.Count == 0)
+                {
+                    i++;
+                    continue;
+                }
+
+                bool r2HasNewOpOrMarker = nonEmpty2.Any(kv =>
+                {
+                    var t = kv.Value.Text.Trim();
+                    return t is ":" or "=" || PrefixColonRegex.IsMatch(t) ||
+                           MarkerRegex.IsMatch(t) || InlineMarkerRegex.IsMatch(t);
+                });
+                if (r2HasNewOpOrMarker)
+                {
+                    i++;
+                    continue;
+                }
+
+                bool allMatched = nonEmpty2.All(kv =>
+                {
+                    if (!map1.TryGetValue(kv.Key, out var target) || string.IsNullOrWhiteSpace(target.Text)) return false;
+                    var targetTrim = target.Text.Trim();
+                    if (targetTrim is ":" or "=" || MarkerRegex.IsMatch(targetTrim)) return false;
+                    if (target.IsBold || kv.Value.IsBold || target.ColSpan != kv.Value.ColSpan) return false;
+                    double maxLeading = Math.Max(8.5, target.FontSizePt) * LeadingRatioMax;
+                    return dy <= maxLeading &&
+                           Math.Abs(target.SourceX0Pt - kv.Value.SourceX0Pt) <= BoldMergeXTolPt &&
+                           (target.BackgroundHex ?? "") == (kv.Value.BackgroundHex ?? "");
+                });
+
+                if (allMatched)
+                {
+                    foreach (var kv in nonEmpty2)
+                    {
+                        var target = map1[kv.Key];
+                        string prevTxt = target.Text.Trim();
+                        string nextTxt = kv.Value.Text.Trim();
+                        string sep = prevTxt.EndsWith(":", StringComparison.Ordinal) ? "\n" : " ";
+                        target.Text = $"{prevTxt}{sep}{nextTxt}";
+                        target.SourceLineCount += kv.Value.SourceLineCount;
+                    }
                     r1.SourceY1Pt = Math.Max(r1.SourceY1Pt, r2.SourceY1Pt);
                     r1.HeightPt = EstimateRowHeightPt(r1.Cells, colWidthsPt);
                     rows.RemoveAt(i + 1);
@@ -1148,6 +1236,18 @@ public sealed class RdlcBuilder
                 i++;
             }
         } while (changed);
+    }
+
+    private static Dictionary<int, CompiledCell> MapCellsByLogicalCol(List<CompiledCell> cells)
+    {
+        var map = new Dictionary<int, CompiledCell>();
+        int col = 0;
+        foreach (var cell in cells)
+        {
+            map[col] = cell;
+            col += cell.ColSpan;
+        }
+        return map;
     }
 
     private static void ApplyBorderRule(
@@ -1743,10 +1843,14 @@ public sealed class RdlcBuilder
             {
                 candXs.Add(sp.X0);
             }
+            else if (PrefixColonRegex.IsMatch(t))
+            {
+                candXs.Add(sp.X0);
+            }
             else
             {
-                var m = Regex.Match(t, @"^(.{2,36}?)\s*([:=])\s+(.+)$");
-                if (m.Success)
+                var m = InlineColonRegex.Match(t);
+                if (m.Success && !(m.Groups[2].Value == ":" && Regex.IsMatch(m.Groups[1].Value.Trim(), @"\d$") && Regex.IsMatch(m.Groups[3].Value.Trim(), @"^\d")))
                 {
                     double ratio = (m.Groups[1].Value.Length + 0.5) / Math.Max(1, t.Length);
                     candXs.Add(sp.X0 + sp.Width * ratio);
@@ -1758,7 +1862,10 @@ public sealed class RdlcBuilder
         return clustered.Where(cx => candXs.Count(x => Math.Abs(x - cx) <= ColonClusterTolPt) >= 2).ToList();
     }
 
-    private static List<TextSpan> SplitInlineMarkersAndOperators(List<TextSpan> rowSpans, SolverStrategyKind strategy)
+    private static List<TextSpan> SplitInlineMarkersAndOperators(
+        List<TextSpan> rowSpans,
+        SolverStrategyKind strategy,
+        List<double> alignedOpXs)
     {
         var result = new List<TextSpan>();
         foreach (var sp in rowSpans)
@@ -1778,14 +1885,28 @@ public sealed class RdlcBuilder
 
             if (strategy is SolverStrategyKind.HLineOperatorSolver or SolverStrategyKind.KeyValueSubGridFlattener)
             {
-                var om = Regex.Match(t, @"^(.{2,36}?)\s*([:=])\s+(.+)$");
-                if (om.Success)
+                var pm = PrefixColonRegex.Match(t);
+                if (pm.Success)
                 {
-                    double ratio = (om.Groups[1].Value.Length + 0.5) / Math.Max(1, t.Length);
-                    double opX = sp.X0 + sp.Width * ratio;
+                    double matchedOpX = alignedOpXs.FirstOrDefault(ax => Math.Abs(ax - sp.X0) <= 4.0);
+                    double opX = matchedOpX > 0 ? matchedOpX : sp.X0;
+                    result.Add(CloneSpan(sp, pm.Groups[1].Value, opX, opX + 9.0));
+                    result.Add(CloneSpan(sp, pm.Groups[2].Value.Trim(), opX + 11.0, Math.Max(opX + 20.0, sp.X1)));
+                    continue;
+                }
+
+                var om = InlineColonRegex.Match(t);
+                if (om.Success && !(om.Groups[2].Value == ":" && Regex.IsMatch(om.Groups[1].Value.Trim(), @"\d$") && Regex.IsMatch(om.Groups[3].Value.Trim(), @"^\d")))
+                {
+                    double estOpX = sp.X0 + Math.Min(sp.Width * 0.45, om.Groups[1].Value.Length * sp.FontSize * 0.52 + 4.0);
+                    double snappedOpX = alignedOpXs
+                        .Where(ax => ax > sp.X0 + 8.0 && Math.Abs(ax - estOpX) <= Math.Max(22.0, om.Groups[1].Value.Length * sp.FontSize * 0.65))
+                        .OrderBy(ax => Math.Abs(ax - estOpX))
+                        .FirstOrDefault();
+                    double opX = snappedOpX > 0 ? snappedOpX : (sp.X0 + sp.Width * ((om.Groups[1].Value.Length + 0.5) / Math.Max(1, t.Length)));
                     result.Add(CloneSpan(sp, om.Groups[1].Value.Trim(), sp.X0, Math.Max(sp.X0 + 8.0, opX - 2.0)));
-                    result.Add(CloneSpan(sp, om.Groups[2].Value, opX, opX + 8.0));
-                    result.Add(CloneSpan(sp, om.Groups[3].Value.Trim(), opX + 9.0, Math.Max(opX + 18.0, sp.X1)));
+                    result.Add(CloneSpan(sp, om.Groups[2].Value, opX, opX + 9.0));
+                    result.Add(CloneSpan(sp, om.Groups[3].Value.Trim(), opX + 11.0, Math.Max(opX + 20.0, sp.X1)));
                     continue;
                 }
             }
@@ -1871,6 +1992,36 @@ public sealed class RdlcBuilder
         }
         bounds.Add(widthPt);
         return bounds;
+    }
+
+    private static List<double> PruneEmptyEdgeGhostColumns(
+        List<double> bounds,
+        List<TextSpan> spans,
+        List<LineSegment> vLines,
+        double widthPt)
+    {
+        var pruned = new List<double>(bounds);
+        if (pruned.Count >= 3)
+        {
+            double b1 = pruned[1];
+            bool anyLeft = spans.Any(s => s.X0 < b1 - 2.0) || vLines.Any(v => v.X0 < b1 - 2.0);
+            bool wallAtB1 = vLines.Any(v => Math.Abs(v.X0 - b1) <= BorderMatchTolPt);
+            if (!anyLeft && !wallAtB1 && b1 <= 24.0)
+            {
+                pruned.RemoveAt(1);
+            }
+        }
+        if (pruned.Count >= 3)
+        {
+            double bLast = pruned[^2];
+            bool anyRight = spans.Any(s => s.X1 > bLast + 2.0) || vLines.Any(v => v.X0 > bLast + 2.0);
+            bool wallAtLast = vLines.Any(v => Math.Abs(v.X0 - bLast) <= BorderMatchTolPt);
+            if (!anyRight && !wallAtLast && widthPt - bLast <= 14.0)
+            {
+                pruned.RemoveAt(pruned.Count - 2);
+            }
+        }
+        return pruned;
     }
 
     private static int FindClosestStartCol(double x0, List<double> colBounds, int numCols)
